@@ -1,0 +1,531 @@
+include "test"
+| include "cedar"
+|
+
+def _parse1(src):
+  first(cedar_parse(src))
+end
+
+# Parses `expr` as the body of a `when` condition and returns its EST.
+def _expr(src):
+  _parse1("permit (principal, action, resource) when { " + src + " };")["conditions"][0]["body"]
+end
+
+def _fails(f):
+  try: do f() | false end catch: true
+end
+
+def _error_message(f):
+  try: do f() | "" end catch(e): e["message"]
+end
+
+# -- Lexer Tests --
+
+def test_unescape_basic():
+  assert_eq(_cedar_unescape("a\\nb\\t\\\"c\\\\", false), "a\nb\t\"c\\")
+end
+
+def test_unescape_unicode():
+  assert_eq(_cedar_unescape("\\u{41}\\u{1F600}", false), "A" + implode([128512]))
+end
+
+def test_unescape_invalid():
+  assert_true(_fails(fn(): _cedar_unescape("\\q", false);))
+end
+
+def test_unescape_star_only_in_patterns():
+  assert_eq(_cedar_unescape("a\\*b", true), "a*b")
+  | assert_true(_fails(fn(): _cedar_unescape("a\\*b", false);))
+  | assert_true(_fails(fn(): cedar_parse("@id(\"a\\*\") permit (principal, action, resource);");))
+end
+
+def test_pattern_wildcards():
+  assert_eq(_cedar_pattern("a*b*"), [{"Literal": "a"}, "Wildcard", {"Literal": "b"}, "Wildcard"])
+end
+
+def test_pattern_escaped_star():
+  assert_eq(_cedar_pattern("a\\*b"), [{"Literal": "a*b"}])
+end
+
+# -- Policy Structure Tests --
+
+def test_parse_empty_input():
+  assert_eq(cedar_parse(""), [])
+end
+
+def test_parse_comment_only():
+  assert_eq(cedar_parse("// nothing here\n"), [])
+end
+
+def test_parse_minimal_permit():
+  assert_eq(_parse1("permit (principal, action, resource);"), {
+    "annotations": {},
+    "effect": "permit",
+    "principal": {"op": "All"},
+    "action": {"op": "All"},
+    "resource": {"op": "All"},
+    "conditions": []
+  })
+end
+
+def test_parse_forbid_effect():
+  assert_eq(_parse1("forbid (principal, action, resource);")["effect"], "forbid")
+end
+
+def test_parse_multiple_policies():
+  let ps = cedar_parse("permit (principal, action, resource);\nforbid (principal, action, resource);")
+  | assert_len(ps, 2)
+  | assert_eq(ps[1]["effect"], "forbid")
+end
+
+def test_parse_annotation_with_value():
+  assert_eq(_parse1("@id(\"p0\") permit (principal, action, resource);")["annotations"], {"id": "p0"})
+end
+
+def test_parse_annotation_without_value():
+  assert_eq(_parse1("@flag permit (principal, action, resource);")["annotations"], {"flag": ""})
+end
+
+def test_parse_multiple_annotations():
+  let ann = _parse1("@id(\"p0\")\n@advice(\"x\")\npermit (principal, action, resource);")["annotations"]
+  | assert_eq(ann["id"], "p0")
+  | assert_eq(ann["advice"], "x")
+end
+
+# -- Scope Tests --
+
+def test_scope_principal_eq():
+  assert_eq(
+    _parse1("permit (principal == User::\"alice\", action, resource);")["principal"],
+    {"op": "==", "entity": {"type": "User", "id": "alice"}}
+  )
+end
+
+def test_scope_principal_in():
+  assert_eq(
+    _parse1("permit (principal in Group::\"admins\", action, resource);")["principal"],
+    {"op": "in", "entity": {"type": "Group", "id": "admins"}}
+  )
+end
+
+def test_scope_namespaced_entity():
+  assert_eq(
+    _parse1("permit (principal == App::Core::User::\"alice\", action, resource);")["principal"]["entity"],
+    {"type": "App::Core::User", "id": "alice"}
+  )
+end
+
+def test_scope_principal_is():
+  assert_eq(
+    _parse1("permit (principal is User, action, resource);")["principal"],
+    {"op": "is", "entity_type": "User"}
+  )
+end
+
+def test_scope_principal_is_in():
+  assert_eq(
+    _parse1("permit (principal is User in Group::\"g\", action, resource);")["principal"],
+    {"op": "is", "entity_type": "User", "in": {"entity": {"type": "Group", "id": "g"}}}
+  )
+end
+
+def test_scope_action_eq():
+  assert_eq(
+    _parse1("permit (principal, action == Action::\"view\", resource);")["action"],
+    {"op": "==", "entity": {"type": "Action", "id": "view"}}
+  )
+end
+
+def test_scope_action_in_set():
+  assert_eq(
+    _parse1("permit (principal, action in [Action::\"a\", Action::\"b\"], resource);")["action"],
+    {"op": "in", "entities": [{"type": "Action", "id": "a"}, {"type": "Action", "id": "b"}]}
+  )
+end
+
+def test_scope_action_in_empty_set():
+  assert_eq(
+    _parse1("permit (principal, action in [], resource);")["action"],
+    {"op": "in", "entities": []}
+  )
+end
+
+def test_scope_action_in_single():
+  assert_eq(
+    _parse1("permit (principal, action in Action::\"all\", resource);")["action"],
+    {"op": "in", "entity": {"type": "Action", "id": "all"}}
+  )
+end
+
+def test_scope_resource_is_in():
+  assert_eq(
+    _parse1("permit (principal, action, resource is Photo in Album::\"a\");")["resource"],
+    {"op": "is", "entity_type": "Photo", "in": {"entity": {"type": "Album", "id": "a"}}}
+  )
+end
+
+def test_scope_slots():
+  let p = _parse1("permit (principal == ?principal, action, resource in ?resource);")
+  | assert_eq(p["principal"], {"op": "==", "slot": "?principal"})
+  | assert_eq(p["resource"], {"op": "in", "slot": "?resource"})
+end
+
+def test_scope_wrong_slot_rejected():
+  assert_true(_fails(fn(): cedar_parse("permit (principal == ?resource, action, resource);");))
+end
+
+def test_scope_action_is_rejected():
+  assert_true(_fails(fn(): cedar_parse("permit (principal, action is Action, resource);");))
+end
+
+# -- Condition Tests --
+
+def test_when_condition():
+  let c = _parse1("permit (principal, action, resource) when { true };")["conditions"][0]
+  | assert_eq(c, {"kind": "when", "body": {"Value": true}})
+end
+
+def test_unless_condition():
+  assert_eq(_parse1("permit (principal, action, resource) unless { false };")["conditions"][0]["kind"], "unless")
+end
+
+def test_multiple_conditions_keep_order():
+  let cs = _parse1("forbid (principal, action, resource) when { true } unless { false } when { true };")["conditions"]
+  | assert_eq(map(cs, fn(c): c["kind"];), ["when", "unless", "when"])
+end
+
+# -- Expression Tests --
+
+def test_expr_literals():
+  assert_eq(_expr("42"), {"Value": 42})
+  | assert_eq(_expr("\"hi\""), {"Value": "hi"})
+  | assert_eq(_expr("false"), {"Value": false})
+end
+
+def test_expr_negative_literal():
+  assert_eq(_expr("-7"), {"Value": -7})
+end
+
+def test_expr_negation_of_expression():
+  assert_eq(_expr("-context.n"), {"neg": {"arg": {".": {"left": {"Var": "context"}, "attr": "n"}}}})
+end
+
+def test_expr_not():
+  assert_eq(_expr("!context.a"), {"!": {"arg": {".": {"left": {"Var": "context"}, "attr": "a"}}}})
+end
+
+def test_expr_variables():
+  assert_eq(_expr("principal"), {"Var": "principal"})
+  | assert_eq(_expr("action"), {"Var": "action"})
+  | assert_eq(_expr("resource"), {"Var": "resource"})
+  | assert_eq(_expr("context"), {"Var": "context"})
+end
+
+def test_expr_entity_literal():
+  assert_eq(_expr("User::\"alice\""), {"Value": {"__entity": {"type": "User", "id": "alice"}}})
+end
+
+def test_expr_attribute_access_chain():
+  assert_eq(
+    _expr("principal.a.b"),
+    {".": {"left": {".": {"left": {"Var": "principal"}, "attr": "a"}}, "attr": "b"}}
+  )
+end
+
+def test_expr_bracket_access():
+  assert_eq(_expr("context[\"x y\"]"), {".": {"left": {"Var": "context"}, "attr": "x y"}})
+end
+
+def test_expr_comparison_ops():
+  assert_eq(_expr("1 < 2"), {"<": {"left": {"Value": 1}, "right": {"Value": 2}}})
+  | assert_eq(_expr("1 <= 2")["<="]["right"], {"Value": 2})
+  | assert_eq(_expr("1 > 2")[">"]["left"], {"Value": 1})
+  | assert_eq(_expr("1 >= 2")[">="]["left"], {"Value": 1})
+  | assert_eq(_expr("1 != 2")["!="]["left"], {"Value": 1})
+  | assert_eq(_expr("1 == 2")["=="]["left"], {"Value": 1})
+end
+
+def test_expr_in_operator():
+  assert_eq(
+    _expr("principal in Group::\"g\""),
+    {"in": {"left": {"Var": "principal"}, "right": {"Value": {"__entity": {"type": "Group", "id": "g"}}}}}
+  )
+end
+
+def test_expr_has_attr():
+  assert_eq(_expr("resource has owner"), {"has": {"left": {"Var": "resource"}, "attr": "owner"}})
+end
+
+def test_expr_has_string_attr():
+  assert_eq(_expr("resource has \"a b\"")["has"]["attr"], "a b")
+end
+
+def test_expr_has_path_desugars():
+  let e = _expr("context has a.b")
+  | assert_eq(e["&&"]["left"], {"has": {"left": {"Var": "context"}, "attr": "a"}})
+  | assert_eq(
+      e["&&"]["right"],
+      {"has": {"left": {".": {"left": {"Var": "context"}, "attr": "a"}}, "attr": "b"}}
+    )
+end
+
+def test_expr_like_pattern():
+  assert_eq(
+    _expr("principal.name like \"a*b\"")["like"]["pattern"],
+    [{"Literal": "a"}, "Wildcard", {"Literal": "b"}]
+  )
+end
+
+def test_expr_is():
+  assert_eq(_expr("resource is Photo"), {"is": {"left": {"Var": "resource"}, "entity_type": "Photo"}})
+end
+
+def test_expr_is_in():
+  let e = _expr("resource is Photo in Album::\"a\"")["is"]
+  | assert_eq(e["entity_type"], "Photo")
+  | assert_eq(e["in"], {"Value": {"__entity": {"type": "Album", "id": "a"}}})
+end
+
+def test_expr_if_then_else():
+  assert_eq(
+    _expr("if true then 1 else 2"),
+    {"if-then-else": {"if": {"Value": true}, "then": {"Value": 1}, "else": {"Value": 2}}}
+  )
+end
+
+def test_expr_arithmetic_precedence():
+  # 1 + 2 * 3  =>  1 + (2 * 3)
+  assert_eq(
+    _expr("1 + 2 * 3"),
+    {"+": {"left": {"Value": 1}, "right": {"*": {"left": {"Value": 2}, "right": {"Value": 3}}}}}
+  )
+end
+
+def test_expr_subtraction_left_associative():
+  # 5 - 2 - 1  =>  (5 - 2) - 1
+  let e = _expr("5 - 2 - 1")
+  | assert_eq(e["-"]["right"], {"Value": 1})
+  | assert_eq(e["-"]["left"]["-"]["left"], {"Value": 5})
+end
+
+def test_expr_logical_precedence():
+  # a || b && c  =>  a || (b && c)
+  let e = _expr("true || false && true")
+  | assert_eq(e["||"]["left"], {"Value": true})
+  | assert_eq(e["||"]["right"]["&&"]["right"], {"Value": true})
+end
+
+def test_expr_comparison_binds_tighter_than_and():
+  let e = _expr("1 < 2 && 3 < 4")
+  | assert_eq(e["&&"]["left"]["<"]["right"], {"Value": 2})
+  | assert_eq(e["&&"]["right"]["<"]["left"], {"Value": 3})
+end
+
+def test_expr_parentheses():
+  assert_eq(
+    _expr("(1 + 2) * 3")["*"]["left"],
+    {"+": {"left": {"Value": 1}, "right": {"Value": 2}}}
+  )
+end
+
+def test_expr_set_literal():
+  assert_eq(_expr("[1, \"a\"]"), {"Set": [{"Value": 1}, {"Value": "a"}]})
+  | assert_eq(_expr("[]"), {"Set": []})
+end
+
+def test_expr_record_literal():
+  assert_eq(
+    _expr("{a: 1, \"b c\": 2}"),
+    {"Record": {"a": {"Value": 1}, "b c": {"Value": 2}}}
+  )
+  | assert_eq(_expr("{}"), {"Record": {}})
+end
+
+# -- Method and Function Tests --
+
+def test_method_contains():
+  assert_eq(
+    _expr("context.tags.contains(\"x\")"),
+    {"contains": {"left": {".": {"left": {"Var": "context"}, "attr": "tags"}}, "right": {"Value": "x"}}}
+  )
+end
+
+def test_method_contains_all_any():
+  assert_eq(_expr("[1].containsAll([1])")["containsAll"]["right"], {"Set": [{"Value": 1}]})
+  | assert_eq(_expr("[1].containsAny([2])")["containsAny"]["right"], {"Set": [{"Value": 2}]})
+end
+
+def test_method_is_empty():
+  assert_eq(_expr("[1].isEmpty()"), {"isEmpty": {"arg": {"Set": [{"Value": 1}]}}})
+end
+
+def test_method_tags():
+  let e = _expr("resource.hasTag(\"k\") && resource.getTag(\"k\") == \"v\"")
+  | assert_eq(e["&&"]["left"]["hasTag"]["right"], {"Value": "k"})
+  | assert_eq(e["&&"]["right"]["=="]["left"]["getTag"]["right"], {"Value": "k"})
+end
+
+def test_extension_function_call():
+  assert_eq(_expr("ip(\"10.0.0.1\")"), {"ip": [{"Value": "10.0.0.1"}]})
+end
+
+def test_extension_method_call():
+  assert_eq(
+    _expr("context.addr.isInRange(ip(\"10.0.0.0/8\"))"),
+    {"isInRange": [{".": {"left": {"Var": "context"}, "attr": "addr"}}, {"ip": [{"Value": "10.0.0.0/8"}]}]}
+  )
+end
+
+def test_extension_method_no_args():
+  assert_eq(_expr("context.addr.isIpv4()")["isIpv4"][1], None)
+end
+
+def test_decimal_comparison():
+  let e = _expr("decimal(\"1.5\").lessThan(decimal(\"2.0\"))")
+  | assert_eq(e["lessThan"][0], {"decimal": [{"Value": "1.5"}]})
+  | assert_eq(e["lessThan"][1], {"decimal": [{"Value": "2.0"}]})
+end
+
+# -- Error Tests --
+
+def test_error_missing_semicolon():
+  assert_true(_fails(fn(): cedar_parse("permit (principal, action, resource)");))
+end
+
+def test_error_missing_scope_clause():
+  assert_true(_fails(fn(): cedar_parse("permit (principal, action);");))
+end
+
+def test_error_unknown_effect():
+  assert_true(_fails(fn(): cedar_parse("allow (principal, action, resource);");))
+end
+
+def test_error_unterminated_string():
+  assert_true(_fails(fn(): cedar_parse("@id(\"x) permit (principal, action, resource);");))
+end
+
+def test_error_unbalanced_condition():
+  assert_true(_fails(fn(): cedar_parse("permit (principal, action, resource) when { true ;");))
+end
+
+def test_error_bare_identifier():
+  assert_true(_fails(fn(): cedar_parse("permit (principal, action, resource) when { foo };");))
+end
+
+def test_error_unexpected_character():
+  assert_true(_fails(fn(): cedar_parse("permit (principal, action, resource) when { 1 # 2 };");))
+end
+
+def test_error_message_has_line():
+  let msg = _error_message(fn(): cedar_parse("permit (principal,\n action,\n resource)\n forbid");)
+  | assert_matches(msg, "line 4")
+end
+
+def test_error_message_names_expected_token():
+  let msg = _error_message(fn(): cedar_parse("permit (principal, action, resource)");)
+  | assert_matches(msg, "expected ';'")
+  | assert_matches(msg, "end of input")
+end
+
+# -- Complex Tests --
+
+def test_parse_realistic_policy():
+  let src = "// album sharing\n@id(\"view\")\npermit (\n  principal in Group::\"viewers\",\n  action in [Action::\"view\", Action::\"list\"],\n  resource is Photo in Album::\"trip\"\n)\nwhen { resource.public || principal == resource.owner }\nunless { resource has archived && resource.archived };\n\nforbid (principal, action, resource)\nunless { context.mfa };"
+  | let ps = cedar_parse(src)
+  | assert_len(ps, 2)
+  | assert_eq(ps[0]["annotations"]["id"], "view")
+  | assert_eq(ps[0]["resource"]["entity_type"], "Photo")
+  | assert_len(ps[0]["conditions"], 2)
+  | assert_eq(ps[1]["effect"], "forbid")
+end
+
+# -- Stringify Tests --
+
+def _roundtrip_expr(src):
+  let ast = _expr(src)
+  | let text = cedar_stringify(_parse1("permit (principal, action, resource) when { " + src + " };"))
+  | assert_eq(_parse1(text)["conditions"][0]["body"], ast)
+end
+
+def test_stringify_minimal():
+  assert_eq(
+    cedar_stringify(_parse1("permit (principal, action, resource);")),
+    "permit (\n  principal,\n  action,\n  resource\n);"
+  )
+end
+
+def test_stringify_scope_and_conditions():
+  let src = "@id(\"p0\")\npermit (\n  principal in Group::\"g\",\n  action in [Action::\"a\", Action::\"b\"],\n  resource is Photo in Album::\"x\"\n)\nwhen { context.ok }\nunless { false };"
+  | assert_eq(cedar_stringify(_parse1(src)), src)
+end
+
+def test_stringify_slots():
+  let src = "permit (\n  principal == ?principal,\n  action,\n  resource in ?resource\n);"
+  | assert_eq(cedar_stringify(_parse1(src)), src)
+end
+
+def test_stringify_multiple_policies_separated_by_blank_line():
+  let text = cedar_stringify(cedar_parse("permit (principal, action, resource); forbid (principal, action, resource);"))
+  | assert_eq(len(cedar_parse(text)), 2)
+  | assert_matches(text, ";\n\nforbid")
+end
+
+def test_stringify_accepts_single_policy():
+  assert_eq(cedar_stringify(_parse1("forbid (principal, action, resource);")), cedar_stringify(cedar_parse("forbid (principal, action, resource);")))
+end
+
+def test_stringify_sample_roundtrip():
+  let src = "@id(\"view\")\npermit (principal in Group::\"v\", action in [Action::\"a\"], resource is Photo in Album::\"t\")\nwhen { resource.public || principal == resource.owner }\nunless { resource has archived && resource.archived };\n\nforbid (principal, action, resource)\nunless { context.mfa && context.ip.isIpv4() };"
+  | let ps = cedar_parse(src)
+  | assert_eq(cedar_parse(cedar_stringify(ps)), ps)
+end
+
+def test_stringify_scope_roundtrip():
+  let srcs = [
+    "permit (principal == User::\"a\", action == Action::\"b\", resource == R::\"c\");",
+    "permit (principal is User, action in [], resource is Photo);",
+    "permit (principal is User in G::\"g\", action in Action::\"all\", resource in A::B::\"c\");"
+  ]
+  | map(srcs, fn(s): assert_eq(cedar_parse(cedar_stringify(cedar_parse(s))), cedar_parse(s));)
+end
+
+def test_stringify_expr_roundtrip_precedence():
+  let srcs = [
+    "(1 + 2) * 3", "1 + 2 * 3", "1 - (2 - 3)", "5 - 2 - 1", "-(1 + 2)", "-context.n", "!(true || false)",
+    "(true || false) && true", "true || false && true", "(1 == 2) == true", "1 < 2 && 3 < 4",
+    "(if true then 1 else 2) + 1", "if true then (if false then 1 else 2) else 3", "-5",
+    "(-5).foo", "(context.a || context.b).foo"
+  ]
+  | map(srcs, fn(s): _roundtrip_expr(s);)
+end
+
+def test_stringify_expr_roundtrip_forms():
+  let srcs = [
+    "principal in Group::\"g\"", "resource has owner", "resource has \"a b\"", "context has a.b.c",
+    "resource is Photo", "resource is Photo in Album::\"a\"", "context[\"a b\"].c", "[1, \"a\", [2]]",
+    "{a: 1, \"b c\": {d: []}}", "{}", "[]", "context.tags.contains(\"x\")", "[1].containsAll([1])",
+    "[1].isEmpty()", "resource.hasTag(\"k\") && resource.getTag(\"k\") == \"v\"", "ip(\"10.0.0.1\")",
+    "context.addr.isInRange(ip(\"10.0.0.0/8\"))", "context.addr.isIpv4()",
+    "decimal(\"1.5\").lessThan(decimal(\"2.0\"))", "User::\"alice\" in Group::\"g\""
+  ]
+  | map(srcs, fn(s): _roundtrip_expr(s);)
+end
+
+def test_stringify_string_escapes_roundtrip():
+  _roundtrip_expr("\"a\\\"b\\\\c\\nd\\te\"")
+end
+
+def test_stringify_like_roundtrip():
+  _roundtrip_expr("context.name like \"a*b\\**\"")
+  | _roundtrip_expr("context.name like \"*\"")
+  | _roundtrip_expr("context.name like \"\"")
+end
+
+def test_stringify_entity_id_with_quote_roundtrip():
+  let ps = cedar_parse("permit (principal == User::\"a\\\"b\", action, resource);")
+  | assert_eq(cedar_parse(cedar_stringify(ps)), ps)
+end
+
+def test_stringify_unsupported_expression():
+  assert_true(_fails(fn(): cedar_stringify([{"effect": "permit", "annotations": {}, "principal": {"op": "All"}, "action": {"op": "All"}, "resource": {"op": "All"}, "conditions": [{"kind": "when", "body": {"bogus": 1}}]}]);))
+end

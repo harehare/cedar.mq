@@ -1,0 +1,813 @@
+# Cedar Policy Language Parser in mq
+# https://docs.cedarpolicy.com/policies/syntax-grammar.html
+# Output follows the Cedar JSON policy format:
+# https://docs.cedarpolicy.com/policies/json-format.html
+
+# -- Lexer --
+
+def _cedar_at(cs, i):
+  if (i < len(cs)): cs[i] else: ""
+end
+
+def _cedar_is_digit(c):
+  c != "" && is_regex_match(c, "^[0-9]$")
+end
+
+def _cedar_is_ident_start(c):
+  c != "" && is_regex_match(c, "^[A-Za-z_]$")
+end
+
+def _cedar_is_ident_char(c):
+  c != "" && is_regex_match(c, "^[A-Za-z0-9_]$")
+end
+
+def _cedar_hex_to_int(hex):
+  fold(to_array(downcase(hex)), 0, ->(acc, c): acc * 16 + index("0123456789abcdef", c);)
+end
+
+# Reads the escape sequence starting at s[i] == "\\". Returns [text, next_index].
+def _cedar_read_escape(s, i, star_ok):
+  let n = len(s)
+  | let e = _cedar_at(s, i + 1)
+  | if (e == "n"): ["\n", i + 2]
+    elif (e == "r"): ["\r", i + 2]
+    elif (e == "t"): ["\t", i + 2]
+    elif (e == "\\"): ["\\", i + 2]
+    elif (e == "0"): [implode([0]), i + 2]
+    elif (e == "\""): ["\"", i + 2]
+    elif (e == "'"): ["'", i + 2]
+    elif (e == "*" && star_ok): ["*", i + 2]
+    elif (e == "u" && _cedar_at(s, i + 2) == "{"):
+      do
+        var j = i + 3
+        | let _ = while (j < n && s[j] != "}"): j += 1 end
+        | if (j >= n || j == i + 3 || j - i - 3 > 6):
+            error("cedar: invalid unicode escape")
+          else:
+            [implode([_cedar_hex_to_int(slice(s, i + 3, j))]), j + 1]
+      end
+    else:
+      error("cedar: invalid escape sequence: \\" + e)
+end
+
+def _cedar_unescape(s, star_ok):
+  var result = ""
+  | var i = 0
+  | let n = len(s)
+  | let _ = while (i < n):
+      if (s[i] != "\\"):
+        do result = result + s[i] | i += 1 | result;
+      else:
+        do
+          let r = _cedar_read_escape(s, i, star_ok)
+          | result = result + r[0]
+          | i = r[1]
+          | result
+        end
+    end
+  | result
+end
+
+def _cedar_lex(src):
+  let cs = to_array(src)
+  | let n = len(cs)
+  | var pos = 0
+  | var line = 1
+  | var tokens = []
+  | let _ = while (pos < n):
+      let c = cs[pos]
+      | let c2 = _cedar_at(cs, pos + 1)
+      | if (c == "\n"):
+          do line += 1 | pos += 1 | tokens end
+        elif (c == " " || c == "\t" || c == "\r"):
+          do pos += 1 | tokens end
+        elif (c == "/" && c2 == "/"):
+          do
+            let _ = while (pos < n && cs[pos] != "\n"): pos += 1 end
+            | tokens
+          end
+        elif (c == "\""):
+          do
+            var buf = []
+            | var closed = false
+            | let start_line = line
+            | pos += 1
+            | let _ = while (pos < n && !closed):
+                          if (cs[pos] == "\""):
+                            do closed = true | pos += 1 | buf end
+                          elif (cs[pos] == "\\"):
+                            do
+                              buf += [cs[pos], _cedar_at(cs, pos + 1)]
+                              | pos += 2
+                              | buf
+                            end
+                          else:
+                            do
+                              line += if (cs[pos] == "\n"): 1 else: 0
+                              | buf += [cs[pos]]
+                              | pos += 1
+                              | buf
+                            end
+                        end
+            | if (!closed): error("cedar: line " + to_string(start_line) + ": unterminated string")
+            | let raw = join(buf, "")
+            | let after_like = !is_empty(tokens) && last(tokens)["t"] == "id" && last(tokens)["v"] == "like"
+            | tokens += [{"t": "str", "v": _cedar_unescape(raw, after_like), "raw": raw, "line": line}]
+            | tokens
+          end
+        elif (_cedar_is_digit(c)):
+          do
+            let start = pos
+            | let _ = while (_cedar_is_digit(_cedar_at(cs, pos))): pos += 1 end
+            | tokens += [{"t": "int", "v": to_number(join(slice(cs, start, pos), "")), "line": line}]
+            | tokens
+          end
+        elif (_cedar_is_ident_start(c)):
+          do
+            let start = pos
+            | let _ = while (_cedar_is_ident_char(_cedar_at(cs, pos))): pos += 1 end
+            | tokens += [{"t": "id", "v": join(slice(cs, start, pos), ""), "line": line}]
+            | tokens
+          end
+        elif (c == "?" && _cedar_is_ident_start(c2)):
+          do
+            let start = pos
+            | pos += 1
+            | let _ = while (_cedar_is_ident_char(_cedar_at(cs, pos))): pos += 1 end
+            | tokens += [{"t": "slot", "v": join(slice(cs, start, pos), ""), "line": line}]
+            | tokens
+          end
+        elif ((c == ":" && c2 == ":") || (c == "=" && c2 == "=") || (c == "!" && c2 == "=") || (c == "<" && c2 == "=") || (c == ">" && c2 == "=") || (c == "&" && c2 == "&") || (c == "|" && c2 == "|")):
+          do tokens += [{"t": "p", "v": c + c2, "line": line}] | pos += 2 | tokens end
+        elif (contains(["(", ")", "{", "}", "[", "]", ",", ";", ".", ":", "@", "<", ">", "!", "+", "-", "*"], c)):
+          do tokens += [{"t": "p", "v": c, "line": line}] | pos += 1 | tokens end
+        else:
+          error("cedar: line " + to_string(line) + ": unexpected character: " + c)
+    end
+  | tokens
+end
+
+# -- Token helpers --
+
+def _cedar_tok(tokens, pos):
+  if (pos < len(tokens)): tokens[pos]
+  else: {"t": "eof", "v": "", "line": if (is_empty(tokens)): 1 else: last(tokens)["line"]}
+end
+
+def _cedar_describe(tok):
+  if (tok["t"] == "eof"): "end of input"
+  elif (tok["t"] == "str"): "\"" + tok["raw"] + "\""
+  else: to_string(tok["v"])
+end
+
+def _cedar_fail(tokens, pos, msg):
+  let tok = _cedar_tok(tokens, pos)
+  | error("cedar: line " + to_string(tok["line"]) + ": " + msg + ", got " + _cedar_describe(tok))
+end
+
+def _cedar_is_p(tokens, pos, v):
+  let tok = _cedar_tok(tokens, pos)
+  | tok["t"] == "p" && tok["v"] == v
+end
+
+def _cedar_is_id(tokens, pos, v):
+  let tok = _cedar_tok(tokens, pos)
+  | tok["t"] == "id" && tok["v"] == v
+end
+
+def _cedar_expect_p(tokens, pos, v):
+  if (_cedar_is_p(tokens, pos, v)): pos + 1
+  else: _cedar_fail(tokens, pos, "expected '" + v + "'")
+end
+
+def _cedar_expect_id(tokens, pos, v):
+  if (_cedar_is_id(tokens, pos, v)): pos + 1
+  else: _cedar_fail(tokens, pos, "expected '" + v + "'")
+end
+
+# -- AST helpers --
+
+def _cedar_node(key, val):
+  set(dict(), key, val)
+end
+
+def _cedar_value(v):
+  _cedar_node("Value", v)
+end
+
+def _cedar_unary(op, arg):
+  _cedar_node(op, {"arg": arg})
+end
+
+def _cedar_bin(op, l, r):
+  _cedar_node(op, {"left": l, "right": r})
+end
+
+def _cedar_attr(op, l, name):
+  _cedar_node(op, {"left": l, "attr": name})
+end
+
+# -- Parser: names and entities --
+
+# Parses `Ident (:: Ident)*` without consuming a trailing `::"id"`.
+def _cedar_p_name(tokens, pos):
+  let first_tok = _cedar_tok(tokens, pos)
+  | if (first_tok["t"] != "id"):
+      _cedar_fail(tokens, pos, "expected identifier")
+    else:
+      do
+        var cur = pos + 1
+        | var parts = [first_tok["v"]]
+        | let _ = while (_cedar_is_p(tokens, cur, "::") && _cedar_tok(tokens, cur + 1)["t"] == "id"):
+                      do
+                        parts += [_cedar_tok(tokens, cur + 1)["v"]]
+                        | cur += 2
+                        | parts
+                      end
+                    end
+        | [cur, join(parts, "::")]
+      end
+end
+
+# Parses `Name::"id"` into {"type", "id"}.
+def _cedar_p_entity(tokens, pos):
+  let r = _cedar_p_name(tokens, pos)
+  | let id_tok = _cedar_tok(tokens, r[0] + 1)
+  | if (!_cedar_is_p(tokens, r[0], "::") || id_tok["t"] != "str"):
+      _cedar_fail(tokens, r[0], "expected '::' followed by an entity id string")
+    else:
+      [r[0] + 2, {"type": r[1], "id": id_tok["v"]}]
+end
+
+# -- Parser: expressions --
+
+# Parses `Expr (, Expr)* close` after the opening token. Returns [pos_after_close, items].
+def _cedar_p_exprs(tokens, pos, close):
+  if (_cedar_is_p(tokens, pos, close)):
+    [pos + 1, []]
+  else:
+    do
+      var cur = pos
+      | var items = []
+      | var done = false
+      | let _ = while (!done):
+                    let r = _cedar_p_expr(tokens, cur)
+                    | items += [r[1]]
+                    | cur = r[0]
+                    | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | items end
+                      else: do done = true | items end
+                  end
+      | [_cedar_expect_p(tokens, cur, close), items]
+    end
+end
+
+def _cedar_p_record(tokens, pos):
+  if (_cedar_is_p(tokens, pos, "}")):
+    [pos + 1, _cedar_node("Record", dict())]
+  else:
+    do
+      var cur = pos
+      | var rec = dict()
+      | var done = false
+      | let _ = while (!done):
+                    let key_tok = _cedar_tok(tokens, cur)
+                    | if (key_tok["t"] != "id" && key_tok["t"] != "str"):
+                        _cedar_fail(tokens, cur, "expected record key")
+                    | let r = _cedar_p_expr(tokens, _cedar_expect_p(tokens, cur + 1, ":"))
+                    | rec = set(rec, key_tok["v"], r[1])
+                    | cur = r[0]
+                    | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | rec end
+                      else: do done = true | rec end
+                  end
+      | [_cedar_expect_p(tokens, cur, "}"), _cedar_node("Record", rec)]
+    end
+end
+
+def _cedar_p_primary(tokens, pos):
+  let tok = _cedar_tok(tokens, pos)
+  | let t = tok["t"]
+  | if (t == "int"): [pos + 1, _cedar_value(tok["v"])]
+    elif (t == "str"): [pos + 1, _cedar_value(tok["v"])]
+    elif (t == "slot"): [pos + 1, _cedar_node("Slot", tok["v"])]
+    elif (t == "id" && tok["v"] == "true"): [pos + 1, _cedar_value(true)]
+    elif (t == "id" && tok["v"] == "false"): [pos + 1, _cedar_value(false)]
+    elif (t == "id" && contains(["principal", "action", "resource", "context"], tok["v"])):
+      [pos + 1, _cedar_node("Var", tok["v"])]
+    elif (t == "id"):
+      do
+        let r = _cedar_p_name(tokens, pos)
+        | if (_cedar_is_p(tokens, r[0], "::")):
+            do
+              let e = _cedar_p_entity(tokens, pos)
+              | [e[0], _cedar_value(_cedar_node("__entity", e[1]))]
+            end
+          elif (_cedar_is_p(tokens, r[0], "(")):
+            do
+              let a = _cedar_p_exprs(tokens, r[0] + 1, ")")
+              | [a[0], _cedar_node(r[1], a[1])]
+            end
+          else:
+            _cedar_fail(tokens, pos, "unexpected identifier")
+      end
+    elif (t == "p" && tok["v"] == "("):
+      do
+        let r = _cedar_p_expr(tokens, pos + 1)
+        | [_cedar_expect_p(tokens, r[0], ")"), r[1]]
+      end
+    elif (t == "p" && tok["v"] == "["):
+      do
+        let r = _cedar_p_exprs(tokens, pos + 1, "]")
+        | [r[0], _cedar_node("Set", r[1])]
+      end
+    elif (t == "p" && tok["v"] == "{"):
+      _cedar_p_record(tokens, pos + 1)
+    else:
+      _cedar_fail(tokens, pos, "expected expression")
+end
+
+def _cedar_method(recv, name, args):
+  if (contains(["contains", "containsAll", "containsAny", "getTag", "hasTag"], name) && len(args) == 1):
+    _cedar_bin(name, recv, args[0])
+  elif (name == "isEmpty" && is_empty(args)):
+    _cedar_unary(name, recv)
+  else:
+    _cedar_node(name, [recv] + args)
+end
+
+# Applies `.attr`, `["attr"]` and `.method(args)` suffixes to base.
+def _cedar_p_access(tokens, pos, base):
+  var cur = pos
+  | var acc = base
+  | var done = false
+  | let _ = while (!done):
+                if (_cedar_is_p(tokens, cur, ".")):
+                  do
+                    let name_tok = _cedar_tok(tokens, cur + 1)
+                    | if (name_tok["t"] != "id"): _cedar_fail(tokens, cur + 1, "expected attribute or method name")
+                    | if (_cedar_is_p(tokens, cur + 2, "(")):
+                        do
+                          let a = _cedar_p_exprs(tokens, cur + 3, ")")
+                          | acc = _cedar_method(acc, name_tok["v"], a[1])
+                          | cur = a[0]
+                          | acc
+                        end
+                      else:
+                        do acc = _cedar_attr(".", acc, name_tok["v"]) | cur += 2 | acc end
+                  end
+                elif (_cedar_is_p(tokens, cur, "[")):
+                  do
+                    let key_tok = _cedar_tok(tokens, cur + 1)
+                    | if (key_tok["t"] != "str"): _cedar_fail(tokens, cur + 1, "expected attribute string")
+                    | acc = _cedar_attr(".", acc, key_tok["v"])
+                    | cur = _cedar_expect_p(tokens, cur + 2, "]")
+                    | acc
+                  end
+                else:
+                  do done = true | acc end
+              end
+  | [cur, acc]
+end
+
+def _cedar_p_unary(tokens, pos):
+  if (_cedar_is_p(tokens, pos, "!")):
+    do
+      let r = _cedar_p_unary(tokens, pos + 1)
+      | [r[0], _cedar_unary("!", r[1])]
+    end
+  elif (_cedar_is_p(tokens, pos, "-")):
+    if (_cedar_tok(tokens, pos + 1)["t"] == "int"):
+      _cedar_p_access(tokens, pos + 2, _cedar_value(0 - _cedar_tok(tokens, pos + 1)["v"]))
+    else:
+      do
+        let r = _cedar_p_unary(tokens, pos + 1)
+        | [r[0], _cedar_unary("neg", r[1])]
+      end
+  else:
+    do
+      let r = _cedar_p_primary(tokens, pos)
+      | _cedar_p_access(tokens, r[0], r[1])
+    end
+end
+
+def _cedar_p_mult(tokens, pos):
+  let r = _cedar_p_unary(tokens, pos)
+  | var cur = r[0]
+  | var acc = r[1]
+  | let _ = while (_cedar_is_p(tokens, cur, "*")):
+                let rr = _cedar_p_unary(tokens, cur + 1)
+                | cur = rr[0]
+                | acc = _cedar_bin("*", acc, rr[1])
+              end
+  | [cur, acc]
+end
+
+def _cedar_p_add(tokens, pos):
+  let r = _cedar_p_mult(tokens, pos)
+  | var cur = r[0]
+  | var acc = r[1]
+  | let _ = while (_cedar_is_p(tokens, cur, "+") || _cedar_is_p(tokens, cur, "-")):
+                let op = _cedar_tok(tokens, cur)["v"]
+                | let rr = _cedar_p_mult(tokens, cur + 1)
+                | cur = rr[0]
+                | acc = _cedar_bin(op, acc, rr[1])
+              end
+  | [cur, acc]
+end
+
+# Parses the attribute path after `has`: `ident`, `"str"` or `ident.ident...`.
+def _cedar_p_has(tokens, pos, l):
+  let tok = _cedar_tok(tokens, pos)
+  | if (tok["t"] != "id" && tok["t"] != "str"):
+      _cedar_fail(tokens, pos, "expected attribute name after 'has'")
+    else:
+      do
+        var cur = pos + 1
+        | var acc = _cedar_attr("has", l, tok["v"])
+        | var base = _cedar_attr(".", l, tok["v"])
+        | let _ = while (_cedar_is_p(tokens, cur, ".") && _cedar_tok(tokens, cur + 1)["t"] == "id"):
+                      let name = _cedar_tok(tokens, cur + 1)["v"]
+                      | acc = _cedar_bin("&&", acc, _cedar_attr("has", base, name))
+                      | base = _cedar_attr(".", base, name)
+                      | cur += 2
+                    end
+        | [cur, acc]
+      end
+end
+
+# Splits a raw string into [{"Literal": ...}, "Wildcard", ...] segments.
+def _cedar_pattern(raw):
+  var segs = []
+  | var buf = ""
+  | var i = 0
+  | let n = len(raw)
+  | let _ = while (i < n):
+                if (raw[i] == "*"):
+                  do
+                    segs += if (buf != ""): [{"Literal": buf}, "Wildcard"] else: ["Wildcard"]
+                    | buf = ""
+                    | i += 1
+                    | segs
+                  end
+                elif (raw[i] == "\\"):
+                  do
+                    let r = _cedar_read_escape(raw, i, true)
+                    | buf = buf + r[0]
+                    | i = r[1]
+                    | buf
+                  end
+                else:
+                  do buf = buf + raw[i] | i += 1 | buf end
+              end
+  | if (buf != ""): segs + [{"Literal": buf}] else: segs
+end
+
+def _cedar_p_relation(tokens, pos):
+  let r = _cedar_p_add(tokens, pos)
+  | let cur = r[0]
+  | let l = r[1]
+  | let tok = _cedar_tok(tokens, cur)
+  | if (tok["t"] == "p" && contains(["==", "!=", "<", "<=", ">", ">="], tok["v"])):
+      do
+        let rr = _cedar_p_add(tokens, cur + 1)
+        | [rr[0], _cedar_bin(tok["v"], l, rr[1])]
+      end
+    elif (tok["t"] == "id" && tok["v"] == "in"):
+      do
+        let rr = _cedar_p_add(tokens, cur + 1)
+        | [rr[0], _cedar_bin("in", l, rr[1])]
+      end
+    elif (tok["t"] == "id" && tok["v"] == "has"):
+      _cedar_p_has(tokens, cur + 1, l)
+    elif (tok["t"] == "id" && tok["v"] == "like"):
+      do
+        let pat = _cedar_tok(tokens, cur + 1)
+        | if (pat["t"] != "str"): _cedar_fail(tokens, cur + 1, "expected pattern string after 'like'")
+        | [cur + 2, _cedar_node("like", {"left": l, "pattern": _cedar_pattern(pat["raw"])})]
+      end
+    elif (tok["t"] == "id" && tok["v"] == "is"):
+      do
+        let nm = _cedar_p_name(tokens, cur + 1)
+        | if (_cedar_is_id(tokens, nm[0], "in")):
+            do
+              let rr = _cedar_p_add(tokens, nm[0] + 1)
+              | [rr[0], _cedar_node("is", {"left": l, "entity_type": nm[1], "in": rr[1]})]
+            end
+          else:
+            [nm[0], _cedar_node("is", {"left": l, "entity_type": nm[1]})]
+      end
+    else:
+      [cur, l]
+end
+
+def _cedar_p_and(tokens, pos):
+  let r = _cedar_p_relation(tokens, pos)
+  | var cur = r[0]
+  | var acc = r[1]
+  | let _ = while (_cedar_is_p(tokens, cur, "&&")):
+                let rr = _cedar_p_relation(tokens, cur + 1)
+                | cur = rr[0]
+                | acc = _cedar_bin("&&", acc, rr[1])
+              end
+  | [cur, acc]
+end
+
+def _cedar_p_or(tokens, pos):
+  let r = _cedar_p_and(tokens, pos)
+  | var cur = r[0]
+  | var acc = r[1]
+  | let _ = while (_cedar_is_p(tokens, cur, "||")):
+                let rr = _cedar_p_and(tokens, cur + 1)
+                | cur = rr[0]
+                | acc = _cedar_bin("||", acc, rr[1])
+              end
+  | [cur, acc]
+end
+
+def _cedar_p_expr(tokens, pos):
+  if (_cedar_is_id(tokens, pos, "if")):
+    do
+      let c = _cedar_p_expr(tokens, pos + 1)
+      | let t = _cedar_p_expr(tokens, _cedar_expect_id(tokens, c[0], "then"))
+      | let e = _cedar_p_expr(tokens, _cedar_expect_id(tokens, t[0], "else"))
+      | [e[0], _cedar_node("if-then-else", {"if": c[1], "then": t[1], "else": e[1]})]
+    end
+  else:
+    _cedar_p_or(tokens, pos)
+end
+
+# -- Parser: policies --
+
+# Parses an entity reference or the matching slot. Returns [pos, key, value]
+# where key is "entity" or "slot".
+def _cedar_p_eref(tokens, pos, var_name):
+  let tok = _cedar_tok(tokens, pos)
+  | if (tok["t"] == "slot"):
+      if (tok["v"] != "?" + var_name):
+        _cedar_fail(tokens, pos, "expected '?" + var_name + "' slot")
+      else:
+        [pos + 1, "slot", tok["v"]]
+    else:
+      do
+        let e = _cedar_p_entity(tokens, pos)
+        | [e[0], "entity", e[1]]
+      end
+end
+
+def _cedar_scope_op(op, ref):
+  set(_cedar_node("op", op), ref[1], ref[2])
+end
+
+# Parses one scope clause (`principal`, `action` or `resource` and its constraint).
+def _cedar_p_scope(tokens, pos, var_name):
+  let pos1 = _cedar_expect_id(tokens, pos, var_name)
+  | if (_cedar_is_p(tokens, pos1, "==")):
+      do
+        let ref = _cedar_p_eref(tokens, pos1 + 1, var_name)
+        | [ref[0], _cedar_scope_op("==", ref)]
+      end
+    elif (_cedar_is_id(tokens, pos1, "in")):
+      if (var_name == "action" && _cedar_is_p(tokens, pos1 + 1, "[")):
+        do
+          var cur = pos1 + 2
+          | var entities = []
+          | var done = _cedar_is_p(tokens, cur, "]")
+          | let _ = while (!done):
+                        let e = _cedar_p_entity(tokens, cur)
+                        | entities += [e[1]]
+                        | cur = e[0]
+                        | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | entities end
+                          else: do done = true | entities end
+                      end
+          | [_cedar_expect_p(tokens, cur, "]"), {"op": "in", "entities": entities}]
+        end
+      else:
+        do
+          let ref = _cedar_p_eref(tokens, pos1 + 1, var_name)
+          | [ref[0], _cedar_scope_op("in", ref)]
+        end
+    elif (_cedar_is_id(tokens, pos1, "is") && var_name != "action"):
+      do
+        let nm = _cedar_p_name(tokens, pos1 + 1)
+        | if (_cedar_is_id(tokens, nm[0], "in")):
+            do
+              let ref = _cedar_p_eref(tokens, nm[0] + 1, var_name)
+              | [ref[0], {"op": "is", "entity_type": nm[1], "in": _cedar_node(ref[1], ref[2])}]
+            end
+          else:
+            [nm[0], {"op": "is", "entity_type": nm[1]}]
+      end
+    else:
+      [pos1, {"op": "All"}]
+end
+
+# Parses `@name("value")` annotations. Returns [pos, annotations].
+def _cedar_p_annotations(tokens, pos):
+  var cur = pos
+  | var anns = dict()
+  | let _ = while (_cedar_is_p(tokens, cur, "@")):
+                let name_tok = _cedar_tok(tokens, cur + 1)
+                | if (name_tok["t"] != "id"): _cedar_fail(tokens, cur + 1, "expected annotation name")
+                | if (_cedar_is_p(tokens, cur + 2, "(")):
+                    do
+                      let val_tok = _cedar_tok(tokens, cur + 3)
+                      | if (val_tok["t"] != "str"): _cedar_fail(tokens, cur + 3, "expected annotation value string")
+                      | anns = set(anns, name_tok["v"], val_tok["v"])
+                      | cur = _cedar_expect_p(tokens, cur + 4, ")")
+                      | anns
+                    end
+                  else:
+                    do anns = set(anns, name_tok["v"], "") | cur += 2 | anns end
+              end
+  | [cur, anns]
+end
+
+def _cedar_p_policy(tokens, pos):
+  let ann = _cedar_p_annotations(tokens, pos)
+  | let eff_tok = _cedar_tok(tokens, ann[0])
+  | if (eff_tok["t"] != "id" || (eff_tok["v"] != "permit" && eff_tok["v"] != "forbid")):
+      _cedar_fail(tokens, ann[0], "expected 'permit' or 'forbid'")
+  | let p1 = _cedar_expect_p(tokens, ann[0] + 1, "(")
+  | let pr = _cedar_p_scope(tokens, p1, "principal")
+  | let ac = _cedar_p_scope(tokens, _cedar_expect_p(tokens, pr[0], ","), "action")
+  | let rs = _cedar_p_scope(tokens, _cedar_expect_p(tokens, ac[0], ","), "resource")
+  | var cur = _cedar_expect_p(tokens, rs[0], ")")
+  | var conds = []
+  | let _ = while (_cedar_is_id(tokens, cur, "when") || _cedar_is_id(tokens, cur, "unless")):
+                let kind = _cedar_tok(tokens, cur)["v"]
+                | let body = _cedar_p_expr(tokens, _cedar_expect_p(tokens, cur + 1, "{"))
+                | conds += [{"kind": kind, "body": body[1]}]
+                | cur = _cedar_expect_p(tokens, body[0], "}")
+              end
+  | cur = _cedar_expect_p(tokens, cur, ";")
+  | [cur, {
+      "annotations": ann[1],
+      "effect": eff_tok["v"],
+      "principal": pr[1],
+      "action": ac[1],
+      "resource": rs[1],
+      "conditions": conds
+    }]
+end
+
+# Parses Cedar policy text and returns an array of policies in the Cedar JSON policy format.
+def cedar_parse(input):
+  let tokens = _cedar_lex(to_string(input))
+  | var cur = 0
+  | var policies = []
+  | let _ = while (cur < len(tokens)):
+                let r = _cedar_p_policy(tokens, cur)
+                | cur = r[0]
+                | policies += [r[1]]
+              end
+  | policies
+end
+
+# -- Stringify --
+
+def _cedar_escape(s):
+  replace(replace(replace(replace(replace(s, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n"), "\r", "\\r"), "\t", "\\t")
+end
+
+def _cedar_quote(s):
+  "\"" + _cedar_escape(s) + "\""
+end
+
+def _cedar_is_ident(s):
+  is_regex_match(s, "^[A-Za-z_][A-Za-z0-9_]*$")
+end
+
+def _cedar_key(s):
+  if (_cedar_is_ident(s)): s else: _cedar_quote(s)
+end
+
+def _cedar_s_entity(e):
+  e["type"] + "::" + _cedar_quote(e["id"])
+end
+
+# Extension functions written as `name(args)`. Any other extension function is a method on its first argument.
+def _cedar_is_constructor(name):
+  contains(["ip", "decimal", "datetime", "duration"], name) || contains(name, "::")
+end
+
+# Binding strength of an expression node: higher binds tighter.
+def _cedar_s_prec(e):
+  if (!is_dict(e)): 7
+  else:
+    do
+      let k = first(keys(e))
+      | if (k == "if-then-else"): 0
+        elif (k == "||"): 1
+        elif (k == "&&"): 2
+        elif (contains(["==", "!=", "<", "<=", ">", ">=", "in", "has", "like", "is"], k)): 3
+        elif (k == "+" || k == "-"): 4
+        elif (k == "*"): 5
+        elif (k == "!" || k == "neg"): 6
+        elif (k == "Value" && is_number(e["Value"]) && e["Value"] < 0): 6
+        else: 7
+    end
+end
+
+# Prints e, parenthesizing it when it binds looser than min_prec.
+def _cedar_s_sub(e, min_prec):
+  let s = _cedar_s_expr(e)
+  | if (_cedar_s_prec(e) < min_prec): "(" + s + ")" else: s
+end
+
+def _cedar_s_args(args):
+  join(map(args, fn(a): _cedar_s_expr(a);), ", ")
+end
+
+def _cedar_s_value(v):
+  if (is_bool(v)): to_string(v)
+  elif (is_dict(v)): _cedar_s_entity(v["__entity"])
+  elif (is_string(v)): _cedar_quote(v)
+  else: to_string(v)
+end
+
+def _cedar_s_segment(seg):
+  if (is_string(seg)): "*"
+  else: replace(_cedar_escape(seg["Literal"]), "*", "\\*")
+end
+
+def _cedar_s_pattern(segs):
+  join(map(segs, fn(s): _cedar_s_segment(s);), "")
+end
+
+def _cedar_s_attr(attr):
+  if (_cedar_is_ident(attr)): "." + attr else: "[" + _cedar_quote(attr) + "]"
+end
+
+def _cedar_s_expr(e):
+  let k = first(keys(e))
+  | let v = e[k]
+  | if (k == "Value"): _cedar_s_value(v)
+    elif (k == "Var" || k == "Slot"): v
+    elif (k == "!"): "!" + _cedar_s_sub(v["arg"], 6)
+    elif (k == "neg"): "-" + _cedar_s_sub(v["arg"], 6)
+    elif (k == "||" || k == "&&" || k == "+" || k == "-" || k == "*"):
+      do
+        let p = _cedar_s_prec(e)
+        | _cedar_s_sub(v["left"], p) + " " + k + " " + _cedar_s_sub(v["right"], p + 1)
+      end
+    elif (contains(["==", "!=", "<", "<=", ">", ">=", "in"], k)):
+      _cedar_s_sub(v["left"], 4) + " " + k + " " + _cedar_s_sub(v["right"], 4)
+    elif (k == "."): _cedar_s_sub(v["left"], 7) + _cedar_s_attr(v["attr"])
+    elif (k == "has"): _cedar_s_sub(v["left"], 4) + " has " + _cedar_key(v["attr"])
+    elif (k == "like"): _cedar_s_sub(v["left"], 4) + " like \"" + _cedar_s_pattern(v["pattern"]) + "\""
+    elif (k == "is"):
+      do
+        let base = _cedar_s_sub(v["left"], 4) + " is " + v["entity_type"]
+        | if (is_none(v["in"])): base else: base + " in " + _cedar_s_sub(v["in"], 4)
+      end
+    elif (k == "if-then-else"):
+      "if " + _cedar_s_expr(v["if"]) + " then " + _cedar_s_expr(v["then"]) + " else " + _cedar_s_expr(v["else"])
+    elif (k == "Set"): "[" + _cedar_s_args(v) + "]"
+    elif (k == "Record"):
+      "{" + join(map(keys(v), fn(rk): _cedar_key(rk) + ": " + _cedar_s_expr(v[rk]);), ", ") + "}"
+    elif (contains(["contains", "containsAll", "containsAny", "getTag", "hasTag"], k)):
+      _cedar_s_sub(v["left"], 7) + "." + k + "(" + _cedar_s_expr(v["right"]) + ")"
+    elif (k == "isEmpty"): _cedar_s_sub(v["arg"], 7) + ".isEmpty()"
+    elif (is_array(v) && _cedar_is_constructor(k)): k + "(" + _cedar_s_args(v) + ")"
+    elif (is_array(v) && !is_empty(v)):
+      _cedar_s_sub(first(v), 7) + "." + k + "(" + _cedar_s_args(slice(v, 1, len(v))) + ")"
+    else:
+      error("cedar: unsupported expression: " + k)
+end
+
+def _cedar_s_ref(ref):
+  if (!is_none(ref["slot"])): ref["slot"] else: _cedar_s_entity(ref["entity"])
+end
+
+def _cedar_s_scope(var_name, scope):
+  let op = scope["op"]
+  | if (op == "All"): var_name
+    elif (op == "==" || (op == "in" && is_none(scope["entities"]))):
+      var_name + " " + op + " " + _cedar_s_ref(scope)
+    elif (op == "in"):
+      var_name + " in [" + join(map(scope["entities"], fn(e): _cedar_s_entity(e);), ", ") + "]"
+    elif (op == "is"):
+      do
+        let base = var_name + " is " + scope["entity_type"]
+        | if (is_none(scope["in"])): base else: base + " in " + _cedar_s_ref(scope["in"])
+      end
+    else:
+      error("cedar: unsupported scope operator: " + to_string(op))
+end
+
+def _cedar_s_policy(p):
+  let anns = p["annotations"]
+  | let ann_lines = if (is_none(anns)): [] else: map(keys(anns), fn(k): "@" + k + "(" + _cedar_quote(anns[k]) + ")\n";)
+  | let conds = map(p["conditions"], fn(c): "\n" + c["kind"] + " { " + _cedar_s_expr(c["body"]) + " }";)
+  | join(ann_lines, "")
+    + p["effect"] + " (\n"
+    + "  " + _cedar_s_scope("principal", p["principal"]) + ",\n"
+    + "  " + _cedar_s_scope("action", p["action"]) + ",\n"
+    + "  " + _cedar_s_scope("resource", p["resource"]) + "\n)"
+    + join(conds, "") + ";"
+end
+
+# Serializes policies in the Cedar JSON policy format (a policy or an array of policies) to Cedar policy text.
+def cedar_stringify(data):
+  if (is_array(data)): join(map(data, fn(p): _cedar_s_policy(p);), "\n\n")
+  else: _cedar_s_policy(data)
+end
