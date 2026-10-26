@@ -1,4 +1,4 @@
-# Cedar Policy Language Parser in mq
+# Cedar Policy Language Parser and Evaluator in mq
 # https://docs.cedarpolicy.com/policies/syntax-grammar.html
 # Output follows the Cedar JSON policy format:
 # https://docs.cedarpolicy.com/policies/json-format.html
@@ -37,14 +37,27 @@ def _cedar_read_escape(s, i, star_ok):
     elif (e == "\""): ["\"", i + 2]
     elif (e == "'"): ["'", i + 2]
     elif (e == "*" && star_ok): ["*", i + 2]
+    elif (e == "x"):
+      do
+        let h = slice(s, i + 2, i + 4)
+        | if (len(h) == 2 && is_regex_match(h, "^[0-9A-Fa-f]{2}$") && _cedar_hex_to_int(h) <= 127):
+            [implode([_cedar_hex_to_int(h)]), i + 4]
+          else:
+            error("cedar: invalid escape sequence: \\x" + h)
+      end
     elif (e == "u" && _cedar_at(s, i + 2) == "{"):
       do
         var j = i + 3
         | let _ = while (j < n && s[j] != "}"): j += 1 end
-        | if (j >= n || j == i + 3 || j - i - 3 > 6):
+        | let hex = slice(s, i + 3, j)
+        | if (j >= n || j == i + 3 || j - i - 3 > 6 || !is_regex_match(hex, "^[0-9A-Fa-f]+$")):
             error("cedar: invalid unicode escape")
           else:
-            [implode([_cedar_hex_to_int(slice(s, i + 3, j))]), j + 1]
+            do
+              let cp = _cedar_hex_to_int(hex)
+              | if (cp > 1114111 || (cp >= 55296 && cp <= 57343)): error("cedar: invalid unicode escape")
+                else: [implode([cp]), j + 1]
+            end
       end
     else:
       error("cedar: invalid escape sequence: \\" + e)
@@ -119,7 +132,8 @@ def _cedar_lex(src):
           do
             let start = pos
             | let _ = while (_cedar_is_digit(_cedar_at(cs, pos))): pos += 1 end
-            | tokens += [{"t": "int", "v": to_number(join(slice(cs, start, pos), "")), "line": line}]
+            | let digits = join(slice(cs, start, pos), "")
+            | tokens += [{"t": "int", "v": to_number(digits), "raw": digits, "line": line}]
             | tokens
           end
         elif (_cedar_is_ident_start(c)):
@@ -185,6 +199,30 @@ def _cedar_expect_id(tokens, pos, v):
   else: _cedar_fail(tokens, pos, "expected '" + v + "'")
 end
 
+# Words that cannot be used as attribute names, record keys or type names.
+def _cedar_reserved(name):
+  contains(["true", "false", "if", "then", "else", "in", "is", "like", "has"], name)
+end
+
+# Checks that the digits of an integer literal fit in a long (a negated literal may reach -2^63).
+def _cedar_int_fits(digits, negated):
+  let d = gsub(digits, "^0+", "")
+  | let limit = if (negated): "9223372036854775808" else: "9223372036854775807"
+  | len(d) < 19 || (len(d) == 19 && d <= limit)
+end
+
+# Number of arguments (not counting the receiver) of each method, or none for unknown names.
+def _cedar_method_arity(name):
+  let table = {
+    "contains": 1, "containsAll": 1, "containsAny": 1, "isEmpty": 0, "getTag": 1, "hasTag": 1,
+    "isIpv4": 0, "isIpv6": 0, "isLoopback": 0, "isMulticast": 0, "isInRange": 1,
+    "lessThan": 1, "lessThanOrEqual": 1, "greaterThan": 1, "greaterThanOrEqual": 1,
+    "offset": 1, "durationSince": 1, "toDate": 0, "toTime": 0,
+    "toMilliseconds": 0, "toSeconds": 0, "toMinutes": 0, "toHours": 0, "toDays": 0
+  }
+  | table[name]
+end
+
 # -- AST helpers --
 
 def _cedar_node(key, val):
@@ -212,13 +250,13 @@ end
 # Parses `Ident (:: Ident)*` without consuming a trailing `::"id"`.
 def _cedar_p_name(tokens, pos):
   let first_tok = _cedar_tok(tokens, pos)
-  | if (first_tok["t"] != "id"):
+  | if (first_tok["t"] != "id" || _cedar_reserved(first_tok["v"])):
       _cedar_fail(tokens, pos, "expected identifier")
     else:
       do
         var cur = pos + 1
         | var parts = [first_tok["v"]]
-        | let _ = while (_cedar_is_p(tokens, cur, "::") && _cedar_tok(tokens, cur + 1)["t"] == "id"):
+        | let _ = while (_cedar_is_p(tokens, cur, "::") && _cedar_tok(tokens, cur + 1)["t"] == "id" && !_cedar_reserved(_cedar_tok(tokens, cur + 1)["v"])):
                       do
                         parts += [_cedar_tok(tokens, cur + 1)["v"]]
                         | cur += 2
@@ -254,7 +292,7 @@ def _cedar_p_exprs(tokens, pos, close):
                     let r = _cedar_p_expr(tokens, cur)
                     | items += [r[1]]
                     | cur = r[0]
-                    | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | items end
+                    | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | done = _cedar_is_p(tokens, cur, close) | items end
                       else: do done = true | items end
                   end
       | [_cedar_expect_p(tokens, cur, close), items]
@@ -271,12 +309,13 @@ def _cedar_p_record(tokens, pos):
       | var done = false
       | let _ = while (!done):
                     let key_tok = _cedar_tok(tokens, cur)
-                    | if (key_tok["t"] != "id" && key_tok["t"] != "str"):
+                    | if ((key_tok["t"] != "id" && key_tok["t"] != "str") || (key_tok["t"] == "id" && _cedar_reserved(key_tok["v"]))):
                         _cedar_fail(tokens, cur, "expected record key")
+                    | if (contains(keys(rec), key_tok["v"])): _cedar_fail(tokens, cur, "duplicate record key")
                     | let r = _cedar_p_expr(tokens, _cedar_expect_p(tokens, cur + 1, ":"))
                     | rec = set(rec, key_tok["v"], r[1])
                     | cur = r[0]
-                    | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | rec end
+                    | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | done = _cedar_is_p(tokens, cur, "}") | rec end
                       else: do done = true | rec end
                   end
       | [_cedar_expect_p(tokens, cur, "}"), _cedar_node("Record", rec)]
@@ -286,9 +325,11 @@ end
 def _cedar_p_primary(tokens, pos):
   let tok = _cedar_tok(tokens, pos)
   | let t = tok["t"]
-  | if (t == "int"): [pos + 1, _cedar_value(tok["v"])]
+  | if (t == "int"):
+      if (_cedar_int_fits(tok["raw"], false)): [pos + 1, _cedar_value(tok["v"])]
+      else: _cedar_fail(tokens, pos, "integer literal out of range")
     elif (t == "str"): [pos + 1, _cedar_value(tok["v"])]
-    elif (t == "slot"): [pos + 1, _cedar_node("Slot", tok["v"])]
+    elif (t == "slot"): _cedar_fail(tokens, pos, "template slots are only allowed in the policy scope")
     elif (t == "id" && tok["v"] == "true"): [pos + 1, _cedar_value(true)]
     elif (t == "id" && tok["v"] == "false"): [pos + 1, _cedar_value(false)]
     elif (t == "id" && contains(["principal", "action", "resource", "context"], tok["v"])):
@@ -304,7 +345,9 @@ def _cedar_p_primary(tokens, pos):
           elif (_cedar_is_p(tokens, r[0], "(")):
             do
               let a = _cedar_p_exprs(tokens, r[0] + 1, ")")
-              | [a[0], _cedar_node(r[1], a[1])]
+              | if (!contains(["ip", "decimal", "datetime", "duration"], r[1])):
+                  _cedar_fail(tokens, pos, "unknown function: " + r[1])
+                else: [a[0], _cedar_node(r[1], a[1])]
             end
           else:
             _cedar_fail(tokens, pos, "unexpected identifier")
@@ -343,10 +386,11 @@ def _cedar_p_access(tokens, pos, base):
                 if (_cedar_is_p(tokens, cur, ".")):
                   do
                     let name_tok = _cedar_tok(tokens, cur + 1)
-                    | if (name_tok["t"] != "id"): _cedar_fail(tokens, cur + 1, "expected attribute or method name")
+                    | if (name_tok["t"] != "id" || _cedar_reserved(name_tok["v"])): _cedar_fail(tokens, cur + 1, "expected attribute or method name")
                     | if (_cedar_is_p(tokens, cur + 2, "(")):
                         do
                           let a = _cedar_p_exprs(tokens, cur + 3, ")")
+                          | if (_cedar_method_arity(name_tok["v"]) != len(a[1])): _cedar_fail(tokens, cur + 1, "unknown method or wrong number of arguments: " + name_tok["v"])
                           | acc = _cedar_method(acc, name_tok["v"], a[1])
                           | cur = a[0]
                           | acc
@@ -368,18 +412,24 @@ def _cedar_p_access(tokens, pos, base):
   | [cur, acc]
 end
 
-def _cedar_p_unary(tokens, pos):
+# Parses prefix operators. `chain` is the operator already applied ("!" or "-"), which may not be mixed with the other.
+def _cedar_p_prefix(tokens, pos, chain):
   if (_cedar_is_p(tokens, pos, "!")):
-    do
-      let r = _cedar_p_unary(tokens, pos + 1)
-      | [r[0], _cedar_unary("!", r[1])]
-    end
-  elif (_cedar_is_p(tokens, pos, "-")):
-    if (_cedar_tok(tokens, pos + 1)["t"] == "int"):
-      _cedar_p_access(tokens, pos + 2, _cedar_value(0 - _cedar_tok(tokens, pos + 1)["v"]))
+    if (chain == "-"): _cedar_fail(tokens, pos, "expected expression")
     else:
       do
-        let r = _cedar_p_unary(tokens, pos + 1)
+        let r = _cedar_p_prefix(tokens, pos + 1, "!")
+        | [r[0], _cedar_unary("!", r[1])]
+      end
+  elif (_cedar_is_p(tokens, pos, "-")):
+    if (chain == "!"): _cedar_fail(tokens, pos, "expected expression")
+    elif (_cedar_tok(tokens, pos + 1)["t"] == "int" && !_cedar_is_p(tokens, pos + 2, ".") && !_cedar_is_p(tokens, pos + 2, "[")):
+      if (_cedar_int_fits(_cedar_tok(tokens, pos + 1)["raw"], true)):
+        _cedar_p_access(tokens, pos + 2, _cedar_value(0 - _cedar_tok(tokens, pos + 1)["v"]))
+      else: _cedar_fail(tokens, pos + 1, "integer literal out of range")
+    else:
+      do
+        let r = _cedar_p_prefix(tokens, pos + 1, "-")
         | [r[0], _cedar_unary("neg", r[1])]
       end
   else:
@@ -387,6 +437,10 @@ def _cedar_p_unary(tokens, pos):
       let r = _cedar_p_primary(tokens, pos)
       | _cedar_p_access(tokens, r[0], r[1])
     end
+end
+
+def _cedar_p_unary(tokens, pos):
+  _cedar_p_prefix(tokens, pos, "")
 end
 
 def _cedar_p_mult(tokens, pos):
@@ -417,14 +471,14 @@ end
 # Parses the attribute path after `has`: `ident`, `"str"` or `ident.ident...`.
 def _cedar_p_has(tokens, pos, l):
   let tok = _cedar_tok(tokens, pos)
-  | if (tok["t"] != "id" && tok["t"] != "str"):
+  | if ((tok["t"] != "id" && tok["t"] != "str") || (tok["t"] == "id" && _cedar_reserved(tok["v"]))):
       _cedar_fail(tokens, pos, "expected attribute name after 'has'")
     else:
       do
         var cur = pos + 1
         | var acc = _cedar_attr("has", l, tok["v"])
         | var base = _cedar_attr(".", l, tok["v"])
-        | let _ = while (_cedar_is_p(tokens, cur, ".") && _cedar_tok(tokens, cur + 1)["t"] == "id"):
+        | let _ = while (_cedar_is_p(tokens, cur, ".") && _cedar_tok(tokens, cur + 1)["t"] == "id" && !_cedar_reserved(_cedar_tok(tokens, cur + 1)["v"])):
                       let name = _cedar_tok(tokens, cur + 1)["v"]
                       | acc = _cedar_bin("&&", acc, _cedar_attr("has", base, name))
                       | base = _cedar_attr(".", base, name)
@@ -436,14 +490,15 @@ end
 
 # Splits a raw string into [{"Literal": ...}, "Wildcard", ...] segments.
 def _cedar_pattern(raw):
-  var segs = []
+  let literal = fn(text): map(to_array(text), fn(c): {"Literal": c};);
+  | var segs = []
   | var buf = ""
   | var i = 0
   | let n = len(raw)
   | let _ = while (i < n):
                 if (raw[i] == "*"):
                   do
-                    segs += if (buf != ""): [{"Literal": buf}, "Wildcard"] else: ["Wildcard"]
+                    segs += literal(buf) + ["Wildcard"]
                     | buf = ""
                     | i += 1
                     | segs
@@ -458,7 +513,7 @@ def _cedar_pattern(raw):
                 else:
                   do buf = buf + raw[i] | i += 1 | buf end
               end
-  | if (buf != ""): segs + [{"Literal": buf}] else: segs
+  | segs + literal(buf)
 end
 
 def _cedar_p_relation(tokens, pos):
@@ -542,7 +597,7 @@ end
 def _cedar_p_eref(tokens, pos, var_name):
   let tok = _cedar_tok(tokens, pos)
   | if (tok["t"] == "slot"):
-      if (tok["v"] != "?" + var_name):
+      if (tok["v"] != "?" + var_name || var_name == "action"):
         _cedar_fail(tokens, pos, "expected '?" + var_name + "' slot")
       else:
         [pos + 1, "slot", tok["v"]]
@@ -575,10 +630,10 @@ def _cedar_p_scope(tokens, pos, var_name):
                         let e = _cedar_p_entity(tokens, cur)
                         | entities += [e[1]]
                         | cur = e[0]
-                        | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | entities end
+                        | if (_cedar_is_p(tokens, cur, ",")): do cur += 1 | done = _cedar_is_p(tokens, cur, "]") | entities end
                           else: do done = true | entities end
                       end
-          | [_cedar_expect_p(tokens, cur, "]"), {"op": "in", "entities": entities}]
+          | [_cedar_expect_p(tokens, cur, "]"), if (len(entities) == 1): {"op": "in", "entity": first(entities)} else: {"op": "in", "entities": entities}]
         end
       else:
         do
@@ -611,12 +666,18 @@ def _cedar_p_annotations(tokens, pos):
                     do
                       let val_tok = _cedar_tok(tokens, cur + 3)
                       | if (val_tok["t"] != "str"): _cedar_fail(tokens, cur + 3, "expected annotation value string")
+                      | if (contains(keys(anns), name_tok["v"])): _cedar_fail(tokens, cur + 1, "duplicate annotation")
                       | anns = set(anns, name_tok["v"], val_tok["v"])
                       | cur = _cedar_expect_p(tokens, cur + 4, ")")
                       | anns
                     end
                   else:
-                    do anns = set(anns, name_tok["v"], "") | cur += 2 | anns end
+                    do
+                      if (contains(keys(anns), name_tok["v"])): _cedar_fail(tokens, cur + 1, "duplicate annotation")
+                      | anns = set(anns, name_tok["v"], None)
+                      | cur += 2
+                      | anns
+                    end
               end
   | [cur, anns]
 end
@@ -630,7 +691,7 @@ def _cedar_p_policy(tokens, pos):
   | let pr = _cedar_p_scope(tokens, p1, "principal")
   | let ac = _cedar_p_scope(tokens, _cedar_expect_p(tokens, pr[0], ","), "action")
   | let rs = _cedar_p_scope(tokens, _cedar_expect_p(tokens, ac[0], ","), "resource")
-  | var cur = _cedar_expect_p(tokens, rs[0], ")")
+  | var cur = _cedar_expect_p(tokens, if (_cedar_is_p(tokens, rs[0], ",")): rs[0] + 1 else: rs[0], ")")
   | var conds = []
   | let _ = while (_cedar_is_id(tokens, cur, "when") || _cedar_is_id(tokens, cur, "unless")):
                 let kind = _cedar_tok(tokens, cur)["v"]
@@ -673,7 +734,7 @@ def _cedar_quote(s):
 end
 
 def _cedar_is_ident(s):
-  is_regex_match(s, "^[A-Za-z_][A-Za-z0-9_]*$")
+  is_regex_match(s, "^[A-Za-z_][A-Za-z0-9_]*$") && !_cedar_reserved(s)
 end
 
 def _cedar_key(s):
@@ -743,7 +804,10 @@ def _cedar_s_expr(e):
   | if (k == "Value"): _cedar_s_value(v)
     elif (k == "Var" || k == "Slot"): v
     elif (k == "!"): "!" + _cedar_s_sub(v["arg"], 6)
-    elif (k == "neg"): "-" + _cedar_s_sub(v["arg"], 6)
+    elif (k == "neg"):
+      # `-1` would read back as a negative literal, so a literal operand keeps its parentheses.
+      if (is_dict(v["arg"]) && is_number(v["arg"]["Value"])): "-(" + _cedar_s_expr(v["arg"]) + ")"
+      else: "-" + _cedar_s_sub(v["arg"], 6)
     elif (k == "||" || k == "&&" || k == "+" || k == "-" || k == "*"):
       do
         let p = _cedar_s_prec(e)
@@ -796,7 +860,7 @@ end
 
 def _cedar_s_policy(p):
   let anns = p["annotations"]
-  | let ann_lines = if (is_none(anns)): [] else: map(keys(anns), fn(k): "@" + k + "(" + _cedar_quote(anns[k]) + ")\n";)
+  | let ann_lines = if (is_none(anns)): [] else: map(keys(anns), fn(k): "@" + k + (if (is_none(anns[k])): "" else: "(" + _cedar_quote(anns[k]) + ")") + "\n";)
   | let conds = map(p["conditions"], fn(c): "\n" + c["kind"] + " { " + _cedar_s_expr(c["body"]) + " }";)
   | join(ann_lines, "")
     + p["effect"] + " (\n"
@@ -810,4 +874,710 @@ end
 def cedar_stringify(data):
   if (is_array(data)): join(map(data, fn(p): _cedar_s_policy(p);), "\n\n")
   else: _cedar_s_policy(data)
+end
+
+# -- Evaluation --
+# Values use the Cedar JSON value format: entities are {"__entity": {"type", "id"}},
+# extension values are {"__extn": {"fn", "arg"}}, sets are arrays and records are dicts.
+
+def _cedar_err(msg):
+  error("cedar: " + msg)
+end
+
+def _cedar_is_entity(v):
+  is_dict(v) && !is_none(v["__entity"])
+end
+
+def _cedar_is_extn(v):
+  is_dict(v) && !is_none(v["__extn"])
+end
+
+def _cedar_is_fn(v, name):
+  _cedar_is_extn(v) && v["__extn"]["fn"] == name
+end
+
+def _cedar_type_name(v):
+  if (is_bool(v)): "bool"
+  elif (is_number(v)): "long"
+  elif (is_string(v)): "string"
+  elif (is_array(v)): "set"
+  elif (_cedar_is_entity(v)): "entity"
+  elif (_cedar_is_extn(v)): v["__extn"]["fn"]
+  else: "record"
+end
+
+def _cedar_pad(n, width):
+  let s = to_string(n)
+  | if (len(s) >= width): s else: slice("0000000000", 0, width - len(s)) + s
+end
+
+def _cedar_int_or_zero(s):
+  if (s == ""): 0 else: to_number(s)
+end
+
+# -- Evaluation: ip --
+
+# MSB-first bits of n.
+def _cedar_bits(n, width):
+  var bits = []
+  | var i = width - 1
+  | let _ = while (i >= 0):
+                bits += [floor(n / pow(2, i)) % 2]
+                | i -= 1
+              end
+  | bits
+end
+
+# Returns the 32 address bits, or [] when s is not a dotted IPv4 address.
+def _cedar_ip4_bits(s):
+  let octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
+  | if (!is_regex_match(s, "^" + octet + "(\\." + octet + "){3}$")): []
+    else: flatten(map(split(s, "\\."), fn(o): _cedar_bits(to_number(o), 8);))
+end
+
+def _cedar_ip6_valid_groups(groups):
+  all(groups, fn(g): is_regex_match(g, "^[0-9A-Fa-f]{1,4}$");)
+end
+
+# Returns the 8 hextets of an IPv6 address without an embedded IPv4 tail, or [] when invalid.
+def _cedar_ip6_groups(s):
+  if (!is_regex_match(s, "^[0-9A-Fa-f:]+$") || contains(s, ":::")): []
+  else:
+    do
+      let halves = split(s, "::")
+      | let left = if (halves[0] == ""): [] else: split(halves[0], ":")
+      | let right = if (len(halves) < 2 || halves[1] == ""): [] else: split(halves[1], ":")
+      | let groups = left + right
+      | if (len(halves) > 2 || !_cedar_ip6_valid_groups(groups)): []
+        elif (len(halves) == 1): if (len(groups) == 8): map(groups, fn(g): _cedar_hex_to_int(g);) else: []
+        elif (len(groups) > 7): []
+        else:
+          map(left + map(range(1, 8 - len(groups)), fn(i): "0";) + right, fn(g): _cedar_hex_to_int(g);)
+    end
+end
+
+# Returns the 128 address bits, or [] when s is not an IPv6 address. Embedded IPv4 tails are rejected, as in Cedar.
+def _cedar_ip6_bits(s):
+  let g = _cedar_ip6_groups(s)
+  | if (is_empty(g)): [] else: flatten(map(g, fn(x): _cedar_bits(x, 16);))
+end
+
+# Parses an `ip` argument into {"v": 4 | 6, "bits": [...], "p": prefix_length}.
+def _cedar_ip_parse(s):
+  if (!is_string(s)): _cedar_err("type error: expected string, got " + _cedar_type_name(s))
+  else:
+    do
+      let slash = index(s, "/")
+      | let addr = if (slash < 0): s else: slice(s, 0, slash)
+      | let pfx = if (slash < 0): "" else: slice(s, slash + 1, len(s))
+      | let is6 = contains(addr, ":")
+      | let bits = if (is6): _cedar_ip6_bits(addr) else: _cedar_ip4_bits(addr)
+      | let width = if (is6): 128 else: 32
+      | if (is_empty(bits) || (slash >= 0 && !is_regex_match(pfx, "^(0|[1-9][0-9]*)$"))):
+          _cedar_err("invalid ip address: " + s)
+        elif (slash >= 0 && to_number(pfx) > width):
+          _cedar_err("invalid ip prefix length: " + s)
+        else:
+          {"v": if (is6): 6 else: 4, "bits": bits, "p": if (slash < 0): width else: to_number(pfx)}
+    end
+end
+
+# True when range a lies entirely inside range b.
+def _cedar_ip_in(a, b):
+  a["v"] == b["v"] && a["p"] >= b["p"] && slice(a["bits"], 0, b["p"]) == slice(b["bits"], 0, b["p"])
+end
+
+# -- Evaluation: decimal --
+
+# Parses a `decimal` argument into [hi, lo] where value = hi * 10000 + lo and 0 <= lo < 10000,
+# so that lexicographic order is numeric order without exceeding 2^53.
+def _cedar_dec_parse(s):
+  if (!is_string(s) || !is_regex_match(s, "^-?[0-9]+\\.[0-9]{1,4}$")):
+    _cedar_err("invalid decimal: " + to_string(s))
+  else:
+    do
+      let neg = starts_with(s, "-")
+      | let parts = split(if (neg): slice(s, 1, len(s)) else: s, "\\.")
+      | let w = to_number(parts[0])
+      | let f = to_number(parts[1] + slice("0000", len(parts[1]), 4))
+      | if (w > 922337203685477 || (w == 922337203685477 && f > (if (neg): 5808 else: 5807))):
+          _cedar_err("decimal out of range: " + s)
+        elif (neg && f > 0): [0 - w - 1, 10000 - f]
+        elif (neg): [0 - w, 0]
+        else: [w, f]
+    end
+end
+
+def _cedar_dec_lt(a, b):
+  a[0] < b[0] || (a[0] == b[0] && a[1] < b[1])
+end
+
+# -- Evaluation: datetime and duration --
+
+def _cedar_days_from_civil(y, m, d):
+  let yy = if (m <= 2): y - 1 else: y
+  | let era = floor(yy / 400)
+  | let yoe = yy - era * 400
+  | let mp = if (m > 2): m - 3 else: m + 9
+  | let doy = floor((153 * mp + 2) / 5) + d - 1
+  | let doe = yoe * 365 + floor(yoe / 4) - floor(yoe / 100) + doy
+  | era * 146097 + doe - 719468
+end
+
+# Returns [year, month, day] for a day count since 1970-01-01.
+def _cedar_civil_from_days(z):
+  let zz = z + 719468
+  | let era = floor(zz / 146097)
+  | let doe = zz - era * 146097
+  | let yoe = floor((doe - floor(doe / 1460) + floor(doe / 36524) - floor(doe / 146096)) / 365)
+  | let doy = doe - (365 * yoe + floor(yoe / 4) - floor(yoe / 100))
+  | let mp = floor((5 * doy + 2) / 153)
+  | let d = doy - floor((153 * mp + 2) / 5) + 1
+  | let m = if (mp < 10): mp + 3 else: mp - 9
+  | [yoe + era * 400 + (if (m <= 2): 1 else: 0), m, d]
+end
+
+def _cedar_days_in_month(y, m):
+  if (m == 2): if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)): 29 else: 28
+  elif (contains([4, 6, 9, 11], m)): 30
+  else: 31
+end
+
+# Parses a `datetime` argument into milliseconds since the Unix epoch.
+def _cedar_dt_parse(s):
+  if (!is_string(s) || !is_regex_match(s, "^[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{3})?(Z|[+-][0-9]{4}))?$")):
+    _cedar_err("invalid datetime: " + to_string(s))
+  else:
+    do
+      let y = to_number(slice(s, 0, 4))
+      | let mo = to_number(slice(s, 5, 7))
+      | let d = to_number(slice(s, 8, 10))
+      | let timed = len(s) > 10
+      | let hh = if (timed): to_number(slice(s, 11, 13)) else: 0
+      | let mi = if (timed): to_number(slice(s, 14, 16)) else: 0
+      | let ss = if (timed): to_number(slice(s, 17, 19)) else: 0
+      | let rest = if (timed): slice(s, 19, len(s)) else: ""
+      | let frac = starts_with(rest, ".")
+      | let msec = if (frac): to_number(slice(rest, 1, 4)) else: 0
+      | let tz = if (frac): slice(rest, 4, len(rest)) else: rest
+      | let tz_h = if (tz == "" || tz == "Z"): 0 else: to_number(slice(tz, 1, 3))
+      | let tz_m = if (tz == "" || tz == "Z"): 0 else: to_number(slice(tz, 3, 5))
+      | let tz_min = (tz_h * 60 + tz_m) * (if (starts_with(tz, "-")): -1 else: 1)
+      | if (mo < 1 || mo > 12 || d < 1 || d > _cedar_days_in_month(y, mo) || hh > 23 || mi > 59 || ss > 59 || tz_h > 23 || tz_m > 59):
+          _cedar_err("invalid datetime: " + s)
+        else:
+          _cedar_days_from_civil(y, mo, d) * 86400000 + (hh * 3600 + mi * 60 + ss) * 1000 + msec - tz_min * 60000
+    end
+end
+
+# Formats milliseconds since the epoch. Values outside years 0000-9999, which `offset` can reach but
+# the constructor cannot, are kept as `<ms>ms` (see _cedar_dt_ms).
+def _cedar_dt_format(ms):
+  let days = floor(ms / 86400000)
+  | let rem = ms - days * 86400000
+  | let ymd = _cedar_civil_from_days(days)
+  | if (ymd[0] < 0 || ymd[0] > 9999):
+      to_string(ms) + "ms"
+    else:
+      _cedar_pad(ymd[0], 4) + "-" + _cedar_pad(ymd[1], 2) + "-" + _cedar_pad(ymd[2], 2)
+      + "T" + _cedar_pad(floor(rem / 3600000), 2) + ":" + _cedar_pad(floor(rem / 60000) % 60, 2)
+      + ":" + _cedar_pad(floor(rem / 1000) % 60, 2) + "." + _cedar_pad(rem % 1000, 3) + "Z"
+end
+
+# Milliseconds of a datetime value: the constructor syntax, or the `<ms>ms` form produced for out-of-range values.
+def _cedar_dt_ms(arg):
+  if (is_string(arg) && is_regex_match(arg, "^-?[0-9]+ms$")): to_number(slice(arg, 0, len(arg) - 2))
+  else: _cedar_dt_parse(arg)
+end
+
+# Parses a `duration` argument into milliseconds.
+def _cedar_dur_parse(s):
+  let re = "^(-?)(?:([0-9]+)d)?(?:([0-9]+)h)?(?:([0-9]+)m)?(?:([0-9]+)s)?(?:([0-9]+)ms)?$"
+  | if (!is_string(s) || s == "" || s == "-" || !is_regex_match(s, re)):
+      _cedar_err("invalid duration: " + to_string(s))
+    else:
+      do
+        let n = fn(i): _cedar_int_or_zero(gsub(s, re, "$" + to_string(i)));
+        | let total = n(2) * 86400000 + n(3) * 3600000 + n(4) * 60000 + n(5) * 1000 + n(6)
+        | if (total >= 9223372036854775807 && s != "9223372036854775807ms" && s != "-9223372036854775808ms"):
+            _cedar_err("duration out of range: " + s)
+          elif (starts_with(s, "-")): 0 - total
+          else: total
+      end
+end
+
+def _cedar_ext_value(name, arg):
+  {"__extn": {"fn": name, "arg": arg}}
+end
+
+def _cedar_duration_value(ms):
+  _cedar_ext_value("duration", to_string(ms) + "ms")
+end
+
+# Comparable key of an extension value: equal keys mean equal values.
+def _cedar_ext_key(v):
+  let name = v["__extn"]["fn"]
+  | let arg = v["__extn"]["arg"]
+  | if (name == "ip"):
+      do
+        let p = _cedar_ip_parse(arg)
+        | [p["v"], p["bits"], p["p"]]
+      end
+    elif (name == "decimal"): _cedar_dec_parse(arg)
+    elif (name == "datetime"): _cedar_dt_ms(arg)
+    elif (name == "duration"): _cedar_dur_parse(arg)
+    else: _cedar_err("unknown extension type: " + to_string(name))
+end
+
+# Returns the parsed payload of extension value v, requiring it to be of type name.
+def _cedar_ext_arg(v, name):
+  if (!_cedar_is_fn(v, name)): _cedar_err("type error: expected " + name + ", got " + _cedar_type_name(v))
+  elif (name == "ip"): _cedar_ip_parse(v["__extn"]["arg"])
+  elif (name == "decimal"): _cedar_dec_parse(v["__extn"]["arg"])
+  elif (name == "datetime"): _cedar_dt_ms(v["__extn"]["arg"])
+  else: _cedar_dur_parse(v["__extn"]["arg"])
+end
+
+# mq numbers are 64-bit floats, so results at or beyond +-2^63 (not exactly representable next to the
+# limits) are treated as overflow.
+def _cedar_check_long(r):
+  if (r >= 9223372036854775807 || r <= -9223372036854775808): _cedar_err("integer overflow") else: r
+end
+
+# Extension functions and methods. `a` holds the evaluated arguments (the receiver first for methods).
+def _cedar_call(name, a):
+  let n = len(a)
+  | if (n == 1 && contains(["ip", "decimal", "datetime", "duration"], name)):
+      do
+        let ok = if (name == "ip"): _cedar_ip_parse(a[0])
+                 elif (name == "decimal"): _cedar_dec_parse(a[0])
+                 elif (name == "datetime"): _cedar_dt_parse(a[0])
+                 else: _cedar_dur_parse(a[0])
+        | _cedar_ext_value(name, a[0])
+      end
+    elif (n == 1 && name == "isIpv4"): _cedar_ext_arg(a[0], "ip")["v"] == 4
+    elif (n == 1 && name == "isIpv6"): _cedar_ext_arg(a[0], "ip")["v"] == 6
+    elif (n == 1 && name == "isLoopback"):
+      _cedar_ip_in(_cedar_ext_arg(a[0], "ip"), _cedar_ip_parse(if (_cedar_ext_arg(a[0], "ip")["v"] == 4): "127.0.0.0/8" else: "::1/128"))
+    elif (n == 1 && name == "isMulticast"):
+      _cedar_ip_in(_cedar_ext_arg(a[0], "ip"), _cedar_ip_parse(if (_cedar_ext_arg(a[0], "ip")["v"] == 4): "224.0.0.0/4" else: "ff00::/8"))
+    elif (n == 2 && name == "isInRange"): _cedar_ip_in(_cedar_ext_arg(a[0], "ip"), _cedar_ext_arg(a[1], "ip"))
+    elif (n == 2 && name == "lessThan"): _cedar_dec_lt(_cedar_ext_arg(a[0], "decimal"), _cedar_ext_arg(a[1], "decimal"))
+    elif (n == 2 && name == "lessThanOrEqual"): !_cedar_dec_lt(_cedar_ext_arg(a[1], "decimal"), _cedar_ext_arg(a[0], "decimal"))
+    elif (n == 2 && name == "greaterThan"): _cedar_dec_lt(_cedar_ext_arg(a[1], "decimal"), _cedar_ext_arg(a[0], "decimal"))
+    elif (n == 2 && name == "greaterThanOrEqual"): !_cedar_dec_lt(_cedar_ext_arg(a[0], "decimal"), _cedar_ext_arg(a[1], "decimal"))
+    elif (n == 2 && name == "offset"):
+      _cedar_ext_value("datetime", _cedar_dt_format(_cedar_check_long(_cedar_ext_arg(a[0], "datetime") + _cedar_ext_arg(a[1], "duration"))))
+    elif (n == 2 && name == "durationSince"):
+      _cedar_duration_value(_cedar_ext_arg(a[0], "datetime") - _cedar_ext_arg(a[1], "datetime"))
+    elif (n == 1 && name == "toDate"):
+      _cedar_ext_value("datetime", _cedar_dt_format(floor(_cedar_ext_arg(a[0], "datetime") / 86400000) * 86400000))
+    elif (n == 1 && name == "toTime"):
+      do
+        let ms = _cedar_ext_arg(a[0], "datetime")
+        | _cedar_duration_value(ms - floor(ms / 86400000) * 86400000)
+      end
+    elif (n == 1 && name == "toMilliseconds"): _cedar_ext_arg(a[0], "duration")
+    elif (n == 1 && name == "toSeconds"): trunc(_cedar_ext_arg(a[0], "duration") / 1000)
+    elif (n == 1 && name == "toMinutes"): trunc(_cedar_ext_arg(a[0], "duration") / 60000)
+    elif (n == 1 && name == "toHours"): trunc(_cedar_ext_arg(a[0], "duration") / 3600000)
+    elif (n == 1 && name == "toDays"): trunc(_cedar_ext_arg(a[0], "duration") / 86400000)
+    else: _cedar_err("unknown function or wrong number of arguments: " + name)
+end
+
+# -- Evaluation: values and entities --
+
+# Normalizes an entity reference given as {"type", "id"}, {"__entity": {...}} or `Type::"id"` text.
+def _cedar_to_uid(x):
+  if (_cedar_is_entity(x)): x["__entity"]
+  elif (is_dict(x) && is_string(x["type"]) && is_string(x["id"])): {"type": x["type"], "id": x["id"]}
+  elif (is_string(x)):
+    do
+      let toks = _cedar_lex(x)
+      | let r = _cedar_p_entity(toks, 0)
+      | if (r[0] != len(toks)): _cedar_fail(toks, r[0], "expected end of entity reference") else: r[1]
+    end
+  else: _cedar_err("invalid entity reference: " + to_string(x))
+end
+
+def _cedar_or(v, default):
+  if (is_none(v)): default else: v
+end
+
+# Indexes entities in the Cedar JSON entity format by `Type::"id"`.
+def _cedar_index_entities(entities):
+  var idx = {}
+  | var i = 0
+  | let list = _cedar_or(entities, [])
+  | let _ = while (i < len(list)):
+                let e = list[i]
+                | let key = _cedar_s_entity(_cedar_to_uid(e["uid"]))
+                | if (!is_none(idx[key])): _cedar_err("duplicate entity: " + key)
+                | idx[key] = {
+                    "attrs": _cedar_or(e["attrs"], {}),
+                    "parents": map(_cedar_or(e["parents"], []), fn(p): _cedar_to_uid(p);),
+                    "tags": _cedar_or(e["tags"], {})
+                  }
+                | i += 1
+              end
+  | idx
+end
+
+def _cedar_lookup(env, uid):
+  env["entities"][_cedar_s_entity(uid)]
+end
+
+# True when entity a is b or a descendant of b.
+def _cedar_descends(env, a, b):
+  let target = _cedar_s_entity(b)
+  | var seen = {}
+  | var stack = [a]
+  | var found = false
+  | let _ = while (!found && !is_empty(stack)):
+                let key = _cedar_s_entity(last(stack))
+                | let ent = env["entities"][key]
+                | stack = slice(stack, 0, len(stack) - 1)
+                | if (key == target): found = true
+                  elif (is_none(seen[key])):
+                    do
+                      seen[key] = true
+                      | if (!is_none(ent)): stack = stack + ent["parents"] else: stack
+                    end
+                  else: stack
+              end
+  | found
+end
+
+# Structural equality: sets ignore order and duplicates, extension values compare by value.
+def _cedar_eq(a, b):
+  if (is_array(a)): is_array(b) && all(a, fn(x): _cedar_set_has(b, x);) && all(b, fn(x): _cedar_set_has(a, x);)
+  elif (_cedar_is_extn(a)): _cedar_is_fn(b, a["__extn"]["fn"]) && _cedar_ext_key(a) == _cedar_ext_key(b)
+  elif (is_dict(a)):
+    is_dict(b) && !_cedar_is_extn(b) && len(keys(a)) == len(keys(b))
+      && all(keys(a), fn(k): contains(keys(b), k) && _cedar_eq(a[k], b[k]);)
+  else: a == b
+end
+
+def _cedar_set_has(s, x):
+  any(s, fn(y): _cedar_eq(y, x);)
+end
+
+def _cedar_dedup(items):
+  fold(items, [], ->(acc, x): if (_cedar_set_has(acc, x)): acc else: acc + [x];)
+end
+
+# Merges runs of adjacent literal elements so that every literal is delimited by wildcards.
+def _cedar_group_literals(elems):
+  fold(elems, [], ->(acc, e):
+    if (is_dict(e) && !is_empty(acc) && is_dict(last(acc))):
+      slice(acc, 0, len(acc) - 1) + [{"Literal": last(acc)["Literal"] + e["Literal"]}]
+    else: acc + [e];)
+end
+
+# Matches s against a pattern given as [{"Literal": ...}, "Wildcard", ...] elements.
+def _cedar_like(s, elems):
+  let segs = _cedar_group_literals(elems)
+  | let texts = map(filter(segs, fn(g): is_dict(g);), fn(g): g["Literal"];)
+  | if (!any(segs, fn(g): is_string(g);)): s == join(texts, "")
+    else:
+      do
+        var parts = texts
+        | var pos = 0
+        | var endpos = len(s)
+        | var ok = true
+        | let _ = if (is_dict(first(segs))):
+                    do
+                      ok = starts_with(s, first(parts))
+                      | pos = len(first(parts))
+                      | parts = slice(parts, 1, len(parts))
+                    end
+        | let _ = if (is_dict(last(segs))):
+                    do
+                      ok = ok && ends_with(s, last(parts)) && len(s) - len(last(parts)) >= pos
+                      | endpos = len(s) - len(last(parts))
+                      | parts = slice(parts, 0, len(parts) - 1)
+                    end
+        | var i = 0
+        | let _ = while (ok && i < len(parts)):
+                      let at = index(slice(s, pos, endpos), parts[i])
+                      | if (at < 0): ok = false else: pos = pos + at + len(parts[i])
+                      | i += 1
+                    end
+        | ok
+      end
+end
+
+# -- Evaluation: expressions --
+
+def _cedar_ev_bool(env, e):
+  let r = _cedar_ev(env, e)
+  | if (is_bool(r)): r else: _cedar_err("type error: expected bool, got " + _cedar_type_name(r))
+end
+
+def _cedar_long(v):
+  if (is_number(v)): v else: _cedar_err("type error: expected long, got " + _cedar_type_name(v))
+end
+
+def _cedar_string(v):
+  if (is_string(v)): v else: _cedar_err("type error: expected string, got " + _cedar_type_name(v))
+end
+
+def _cedar_set(v):
+  if (is_array(v)): v else: _cedar_err("type error: expected set, got " + _cedar_type_name(v))
+end
+
+def _cedar_entity(v):
+  if (_cedar_is_entity(v)): v["__entity"] else: _cedar_err("type error: expected entity, got " + _cedar_type_name(v))
+end
+
+# Ordering key of a long, datetime or duration, tagged with its type.
+def _cedar_ord_key(v):
+  if (is_number(v)): ["long", v]
+  elif (_cedar_is_fn(v, "datetime") || _cedar_is_fn(v, "duration")): [v["__extn"]["fn"], _cedar_ext_key(v)]
+  else: _cedar_err("type error: expected long, datetime or duration, got " + _cedar_type_name(v))
+end
+
+def _cedar_compare(op, a, b):
+  let ka = _cedar_ord_key(a)
+  | let kb = _cedar_ord_key(b)
+  | if (ka[0] != kb[0]): _cedar_err("type error: cannot compare " + ka[0] + " with " + kb[0])
+    elif (op == "<"): ka[1] < kb[1]
+    elif (op == "<="): ka[1] <= kb[1]
+    elif (op == ">"): ka[1] > kb[1]
+    else: ka[1] >= kb[1]
+end
+
+def _cedar_in(env, l, r):
+  let a = _cedar_entity(l)
+  | if (is_array(r)):
+      do
+        let targets = map(r, fn(x): _cedar_entity(x);)
+        | any(targets, fn(t): _cedar_descends(env, a, t);)
+      end
+    else: _cedar_descends(env, a, _cedar_entity(r))
+end
+
+def _cedar_attr_of(env, l, attr):
+  if (_cedar_is_entity(l)):
+    do
+      let ent = _cedar_lookup(env, l["__entity"])
+      | if (is_none(ent)): _cedar_err("entity does not exist: " + _cedar_s_entity(l["__entity"]))
+        elif (!contains(keys(ent["attrs"]), attr)): _cedar_err("attribute `" + attr + "` not found on " + _cedar_s_entity(l["__entity"]))
+        else: ent["attrs"][attr]
+    end
+  elif (is_dict(l) && !_cedar_is_extn(l)):
+    if (contains(keys(l), attr)): l[attr] else: _cedar_err("attribute `" + attr + "` not found in record")
+  else: _cedar_err("type error: expected entity or record, got " + _cedar_type_name(l))
+end
+
+def _cedar_has_attr(env, l, attr):
+  if (_cedar_is_entity(l)):
+    do
+      let ent = _cedar_lookup(env, l["__entity"])
+      | !is_none(ent) && contains(keys(ent["attrs"]), attr)
+    end
+  elif (is_dict(l) && !_cedar_is_extn(l)): contains(keys(l), attr)
+  else: _cedar_err("type error: expected entity or record, got " + _cedar_type_name(l))
+end
+
+def _cedar_tag(env, l, name, required):
+  let uid = _cedar_entity(l)
+  | let tag = _cedar_string(name)
+  | let ent = _cedar_lookup(env, uid)
+  | let present = !is_none(ent) && contains(keys(ent["tags"]), tag)
+  | if (!required): present
+    elif (present): ent["tags"][tag]
+    else: _cedar_err("tag `" + tag + "` not found on " + _cedar_s_entity(uid))
+end
+
+def _cedar_var(env, name):
+  if (is_none(env[name])): _cedar_err("`" + name + "` is not bound in the request") else: env[name]
+end
+
+# Evaluates an expression in the Cedar JSON policy format. Raises an error on evaluation failure.
+def _cedar_ev(env, e):
+  let k = first(keys(e))
+  | let v = e[k]
+  | if (k == "Value"): v
+    elif (k == "Var"): _cedar_var(env, v)
+    elif (k == "&&"): if (_cedar_ev_bool(env, v["left"])): _cedar_ev_bool(env, v["right"]) else: false
+    elif (k == "||"): if (_cedar_ev_bool(env, v["left"])): true else: _cedar_ev_bool(env, v["right"])
+    elif (k == "!"): !_cedar_ev_bool(env, v["arg"])
+    elif (k == "if-then-else"): if (_cedar_ev_bool(env, v["if"])): _cedar_ev(env, v["then"]) else: _cedar_ev(env, v["else"])
+    elif (k == "=="): _cedar_eq(_cedar_ev(env, v["left"]), _cedar_ev(env, v["right"]))
+    elif (k == "!="): !_cedar_eq(_cedar_ev(env, v["left"]), _cedar_ev(env, v["right"]))
+    elif (contains(["<", "<=", ">", ">="], k)): _cedar_compare(k, _cedar_ev(env, v["left"]), _cedar_ev(env, v["right"]))
+    elif (k == "+"): _cedar_check_long(_cedar_long(_cedar_ev(env, v["left"])) + _cedar_long(_cedar_ev(env, v["right"])))
+    elif (k == "-"): _cedar_check_long(_cedar_long(_cedar_ev(env, v["left"])) - _cedar_long(_cedar_ev(env, v["right"])))
+    elif (k == "*"): _cedar_check_long(_cedar_long(_cedar_ev(env, v["left"])) * _cedar_long(_cedar_ev(env, v["right"])))
+    elif (k == "neg"): _cedar_check_long(0 - _cedar_long(_cedar_ev(env, v["arg"])))
+    elif (k == "."): _cedar_attr_of(env, _cedar_ev(env, v["left"]), v["attr"])
+    elif (k == "has"): _cedar_has_attr(env, _cedar_ev(env, v["left"]), v["attr"])
+    elif (k == "in"): _cedar_in(env, _cedar_ev(env, v["left"]), _cedar_ev(env, v["right"]))
+    elif (k == "like"): _cedar_like(_cedar_string(_cedar_ev(env, v["left"])), v["pattern"])
+    elif (k == "is"):
+      do
+        let l = _cedar_ev(env, v["left"])
+        | _cedar_entity(l)["type"] == v["entity_type"] && (is_none(v["in"]) || _cedar_in(env, l, _cedar_ev(env, v["in"])))
+      end
+    elif (k == "Set"): _cedar_dedup(map(v, fn(x): _cedar_ev(env, x);))
+    elif (k == "Record"): fold(keys(v), {}, ->(acc, rk): set(acc, rk, _cedar_ev(env, v[rk]));)
+    elif (k == "contains"): _cedar_set_has(_cedar_set(_cedar_ev(env, v["left"])), _cedar_ev(env, v["right"]))
+    elif (k == "containsAll"):
+      do
+        let l = _cedar_set(_cedar_ev(env, v["left"]))
+        | let r = _cedar_set(_cedar_ev(env, v["right"]))
+        | all(r, fn(x): _cedar_set_has(l, x);)
+      end
+    elif (k == "containsAny"):
+      do
+        let l = _cedar_set(_cedar_ev(env, v["left"]))
+        | let r = _cedar_set(_cedar_ev(env, v["right"]))
+        | any(r, fn(x): _cedar_set_has(l, x);)
+      end
+    elif (k == "isEmpty"): is_empty(_cedar_set(_cedar_ev(env, v["arg"])))
+    elif (k == "hasTag"): _cedar_tag(env, _cedar_ev(env, v["left"]), _cedar_ev(env, v["right"]), false)
+    elif (k == "getTag"): _cedar_tag(env, _cedar_ev(env, v["left"]), _cedar_ev(env, v["right"]), true)
+    elif (k == "Slot"): _cedar_err("unlinked template slot: " + v)
+    elif (is_array(v)): _cedar_call(k, map(v, fn(x): _cedar_ev(env, x);))
+    else: _cedar_err("unsupported expression: " + k)
+end
+
+# -- Evaluation: policies --
+
+def _cedar_eref_uid(ref):
+  if (!is_none(ref["slot"])): _cedar_err("unlinked template slot: " + ref["slot"]) else: ref["entity"]
+end
+
+# Checks one scope constraint (`principal`, `action` or `resource`) against the request.
+def _cedar_scope_matches(env, var_name, scope):
+  let uid = env[var_name]["__entity"]
+  | let op = scope["op"]
+  | if (op == "All"): true
+    elif (op == "=="): _cedar_eq({"__entity": uid}, {"__entity": _cedar_eref_uid(scope)})
+    elif (op == "in" && !is_none(scope["entities"])): any(scope["entities"], fn(t): _cedar_descends(env, uid, t);)
+    elif (op == "in"): _cedar_descends(env, uid, _cedar_eref_uid(scope))
+    elif (op == "is"):
+      uid["type"] == scope["entity_type"] && (is_none(scope["in"]) || _cedar_descends(env, uid, _cedar_eref_uid(scope["in"])))
+    else: _cedar_err("unsupported scope operator: " + to_string(op))
+end
+
+# True when the policy's scope and all its conditions hold. Raises an error when evaluation fails.
+def _cedar_satisfied(env, p):
+  var ok = _cedar_scope_matches(env, "principal", p["principal"])
+            && _cedar_scope_matches(env, "action", p["action"])
+            && _cedar_scope_matches(env, "resource", p["resource"])
+  | var i = 0
+  | let conds = p["conditions"]
+  | let _ = while (ok && i < len(conds)):
+                let r = _cedar_ev_bool(env, conds[i]["body"])
+                | ok = if (conds[i]["kind"] == "when"): r else: !r
+                | i += 1
+              end
+  | ok
+end
+
+# Builds the evaluation environment from a request and entities. Request keys that are absent stay unbound.
+def _cedar_env(request, entities):
+  let ctx = _cedar_or(request["context"], {})
+  | if (!is_dict(ctx) || _cedar_is_entity(ctx) || _cedar_is_extn(ctx)): _cedar_err("request context must be a record")
+    else:
+      do
+        var env = {"context": ctx, "entities": _cedar_index_entities(entities)}
+        | let _ = foreach (name, ["principal", "action", "resource"]):
+                    if (!is_none(request[name])): env[name] = {"__entity": _cedar_to_uid(request[name])} else: env
+                  end
+        | env
+      end
+end
+
+def _cedar_policy_list(policies):
+  if (is_string(policies)): cedar_parse(policies)
+  elif (is_dict(policies)): [policies]
+  else: policies
+end
+
+def _cedar_policy_id(p, i):
+  let id = p["annotations"]["id"]
+  | if (is_none(id)): "policy" + to_string(i) else: id
+end
+
+# Evaluates every policy against the request.
+# Returns {"decision": "allow" | "deny", "reasons": [policy ids], "errors": [{"policy", "message"}]}.
+#   policies: Cedar policy text, a policy, or an array of policies in the Cedar JSON policy format
+#   request:  {"principal": {"type", "id"}, "action": {"type", "id"}, "resource": {"type", "id"}, "context": {...}}
+#   entities: array of {"uid", "attrs", "parents", "tags"} in the Cedar JSON entity format
+def cedar_is_authorized(policies, request, entities):
+  let ps = _cedar_policy_list(policies)
+  | let env = _cedar_env(request, entities)
+  | if (is_none(env["principal"]) || is_none(env["action"]) || is_none(env["resource"])):
+      _cedar_err("request requires principal, action and resource")
+    else:
+      do
+        var results = []
+        | var i = 0
+        | let _ = while (i < len(ps)):
+                      let p = ps[i]
+                      | let id = _cedar_policy_id(p, i)
+                      | let r = try: {"id": id, "effect": p["effect"], "satisfied": _cedar_satisfied(env, p), "error": ""}
+                                catch(e): {"id": id, "effect": p["effect"], "satisfied": false, "error": e["message"]}
+                      | results += [r]
+                      | i += 1
+                    end
+        | let forbids = filter(results, fn(r): r["satisfied"] && r["effect"] == "forbid";)
+        | let permits = filter(results, fn(r): r["satisfied"] && r["effect"] == "permit";)
+        | {
+            "decision": if (is_empty(forbids) && !is_empty(permits)): "allow" else: "deny",
+            "reasons": map(if (is_empty(forbids)): permits else: forbids, fn(r): r["id"];),
+            "errors": map(filter(results, fn(r): r["error"] != "";), fn(r): {"policy": r["id"], "message": r["error"]};)
+          }
+      end
+end
+
+# Evaluates one expression, given as Cedar expression text or in the Cedar JSON policy format,
+# and returns its value (booleans, numbers, strings, arrays for sets, dicts for records,
+# {"__entity": ...} for entities and {"__extn": ...} for extension values). Raises an error on failure.
+def cedar_eval(expr, request, entities):
+  let node = if (is_string(expr)):
+    do
+      let toks = _cedar_lex(expr)
+      | let r = _cedar_p_expr(toks, 0)
+      | if (r[0] != len(toks)): _cedar_fail(toks, r[0], "expected end of expression") else: r[1]
+    end
+  else: expr
+  | _cedar_ev(_cedar_env(request, entities), node)
+end
+
+# -- Templates --
+
+def _cedar_subst(node, slots):
+  if (is_array(node)): map(node, fn(x): _cedar_subst(x, slots);)
+  elif (is_dict(node)):
+    if (is_string(node["Slot"]) && len(keys(node)) == 1): {"Value": {"__entity": slots[node["Slot"]]}}
+    else: fold(keys(node), {}, ->(acc, k): set(acc, k, _cedar_subst(node[k], slots));)
+  else: node
+end
+
+def _cedar_link_scope(scope, slots):
+  let ref = fn(r): if (is_none(r["slot"])): r else: {"entity": slots[r["slot"]]};
+  | if (!is_none(scope["slot"])): set(del(scope, "slot"), "entity", slots[scope["slot"]])
+    elif (!is_none(scope["in"])): set(scope, "in", ref(scope["in"]))
+    else: scope
+end
+
+def _cedar_scope_slots(scope):
+  (if (is_none(scope["slot"])): [] else: [scope["slot"]]) + (if (is_none(scope["in"]) || is_none(scope["in"]["slot"])): [] else: [scope["in"]["slot"]])
+end
+
+# Instantiates a policy template by replacing its `?principal` / `?resource` slots.
+# `slots` maps slot names to entity references, e.g. {"?principal": {"type": "User", "id": "alice"}}.
+def cedar_link(policy, slots):
+  let wanted = _cedar_scope_slots(policy["principal"]) + _cedar_scope_slots(policy["resource"])
+  | let uids = fold(keys(slots), {}, ->(acc, k): set(acc, k, _cedar_to_uid(slots[k]));)
+  | let missing = filter(wanted, fn(s): is_none(uids[s]);)
+  | if (!is_empty(missing)): _cedar_err("missing template slot: " + first(missing))
+    else:
+      set(set(set(policy, "principal", _cedar_link_scope(policy["principal"], uids)),
+        "resource", _cedar_link_scope(policy["resource"], uids)),
+        "conditions", _cedar_subst(policy["conditions"], uids))
 end

@@ -29,6 +29,23 @@ def test_unescape_unicode():
   assert_eq(_cedar_unescape("\\u{41}\\u{1F600}", false), "A" + implode([128512]))
 end
 
+def test_unescape_hex():
+  assert_eq(_cedar_unescape("\\x41\\x7f", false), "A" + implode([127]))
+  | assert_true(_fails(fn(): _cedar_unescape("\\x80", false);))
+  | assert_true(_fails(fn(): _cedar_unescape("\\x4", false);))
+  | assert_true(_fails(fn(): _cedar_unescape("\\xzz", false);))
+end
+
+def test_unescape_unicode_validation():
+  assert_eq(_cedar_unescape("\\u{10FFFF}", false), implode([1114111]))
+  | assert_true(_fails(fn(): _cedar_unescape("\\u{110000}", false);))
+  | assert_true(_fails(fn(): _cedar_unescape("\\u{D800}", false);))
+  | assert_true(_fails(fn(): _cedar_unescape("\\u{DFFF}", false);))
+  | assert_true(_fails(fn(): _cedar_unescape("\\u{zz}", false);))
+  | assert_true(_fails(fn(): _cedar_unescape("\\u{1234567}", false);))
+  | assert_true(_fails(fn(): _cedar_unescape("\\u{}", false);))
+end
+
 def test_unescape_invalid():
   assert_true(_fails(fn(): _cedar_unescape("\\q", false);))
 end
@@ -44,7 +61,21 @@ def test_pattern_wildcards():
 end
 
 def test_pattern_escaped_star():
-  assert_eq(_cedar_pattern("a\\*b"), [{"Literal": "a*b"}])
+  assert_eq(_cedar_pattern("a\\*b"), [{"Literal": "a"}, {"Literal": "*"}, {"Literal": "b"}])
+end
+
+def test_pattern_one_literal_per_character():
+  assert_eq(_cedar_pattern("ab*"), [{"Literal": "a"}, {"Literal": "b"}, "Wildcard"])
+  | assert_eq(_cedar_pattern(""), [])
+  | assert_eq(_cedar_pattern("*"), ["Wildcard"])
+end
+
+def test_like_groups_adjacent_literals():
+  assert_eq(_cedar_like("xaxbxc", _cedar_pattern("a*bc")), false)
+  | assert_eq(_cedar_like("xabcx", _cedar_pattern("*abc*")), true)
+  | assert_eq(_cedar_like("a-b-c", _cedar_pattern("a*b*c")), true)
+  | assert_eq(_cedar_like("ab", [{"Literal": "a"}, {"Literal": "b"}]), true)
+  | assert_eq(_cedar_like("abc", [{"Literal": "abc"}, "Wildcard"]), true)
 end
 
 # -- Policy Structure Tests --
@@ -83,7 +114,19 @@ def test_parse_annotation_with_value():
 end
 
 def test_parse_annotation_without_value():
-  assert_eq(_parse1("@flag permit (principal, action, resource);")["annotations"], {"flag": ""})
+  assert_eq(_parse1("@flag permit (principal, action, resource);")["annotations"], {"flag": None})
+end
+
+def test_parse_annotation_empty_string_differs_from_flag():
+  let anns = _parse1("@flag @empty(\"\") permit (principal, action, resource);")["annotations"]
+  | assert_eq(anns["empty"], "")
+  | assert_true(is_none(anns["flag"]))
+  | assert_eq(cedar_stringify(_parse1("@flag @empty(\"\") permit (principal, action, resource);")), "@flag\n@empty(\"\")\npermit (\n  principal,\n  action,\n  resource\n);")
+end
+
+def test_parse_duplicate_annotation_rejected():
+  assert_true(_fails(fn(): cedar_parse("@id(\"a\") @id(\"b\") permit (principal, action, resource);");))
+  | assert_true(_fails(fn(): cedar_parse("@a @a permit (principal, action, resource);");))
 end
 
 def test_parse_multiple_annotations():
@@ -148,6 +191,80 @@ def test_scope_action_in_empty_set():
     _parse1("permit (principal, action in [], resource);")["action"],
     {"op": "in", "entities": []}
   )
+end
+
+def test_scope_action_in_one_element_set_is_single_entity():
+  assert_eq(
+    _parse1("permit (principal, action in [Action::\"a\"], resource);")["action"],
+    {"op": "in", "entity": {"type": "Action", "id": "a"}}
+  )
+end
+
+def test_trailing_commas():
+  assert_eq(len(cedar_parse("permit (principal, action, resource,);")), 1)
+  | assert_eq(_parse1("permit (principal, action in [Action::\"a\", Action::\"b\",], resource);")["action"]["entities"][1], {"type": "Action", "id": "b"})
+  | assert_eq(_expr("[1, 2,]"), {"Set": [{"Value": 1}, {"Value": 2}]})
+  | assert_eq(_expr("{a: 1,}"), {"Record": {"a": {"Value": 1}}})
+  | assert_eq(_expr("[1].contains(1,)")["contains"]["right"], {"Value": 1})
+  | assert_true(_fails(fn(): _expr("[,]");))
+  | assert_true(_fails(fn(): cedar_parse("permit (principal, action, resource,,);");))
+end
+
+def test_reserved_words_are_not_attribute_names():
+  let words = ["true", "false", "if", "then", "else", "in", "is", "like", "has"]
+  | map(words, fn(w):
+      assert_true(_fails(fn(): _expr("context." + w);))
+      | assert_true(_fails(fn(): _expr("context has " + w);))
+      | assert_true(_fails(fn(): _expr("{" + w + ": 1}");))
+      | assert_eq(_expr("context[\"" + w + "\"]")["."]["attr"], w)
+      | assert_eq(_expr("{\"" + w + "\": 1}")["Record"][w], {"Value": 1});)
+  | assert_eq(_expr("context.principal")["."]["attr"], "principal")
+  | assert_eq(_expr("context.permit")["."]["attr"], "permit")
+  | assert_true(_fails(fn(): cedar_parse("permit (principal is if, action, resource);");))
+end
+
+def test_integer_literal_range():
+  assert_true(_fails(fn(): _expr("9223372036854775808");))
+  | assert_true(_fails(fn(): _expr("99999999999999999999");))
+  | assert_true(_fails(fn(): _expr("-9223372036854775809");))
+  | assert_true(_fails(fn(): _expr("-9223372036854775808.foo");))
+  | assert_eq(_expr("-9223372036854775808"), {"Value": -9223372036854775808})
+  | assert_eq(_expr("00000000000000000000001"), {"Value": 1})
+end
+
+def test_unary_operators_do_not_mix():
+  assert_true(_fails(fn(): _expr("!-1");))
+  | assert_true(_fails(fn(): _expr("-!true");))
+  | assert_eq(_expr("!!true"), {"!": {"arg": {"!": {"arg": {"Value": true}}}}})
+  | assert_eq(_expr("--1"), {"neg": {"arg": {"Value": -1}}})
+  | assert_eq(_expr("-(1)"), {"neg": {"arg": {"Value": 1}}})
+end
+
+def test_negative_literal_is_not_a_receiver():
+  assert_eq(_expr("-1.offset(duration(\"1h\"))")["neg"]["arg"]["offset"][0], {"Value": 1})
+  | assert_eq(_expr("(-1).offset(duration(\"1h\"))")["offset"][0], {"Value": -1})
+  | assert_eq(_expr("-1 + 2"), {"+": {"left": {"Value": -1}, "right": {"Value": 2}}})
+  | assert_eq(_expr("-context.n"), {"neg": {"arg": {".": {"left": {"Var": "context"}, "attr": "n"}}}})
+end
+
+def test_slots_only_in_scope():
+  assert_true(_fails(fn(): _expr("principal == ?principal");))
+  | assert_true(_fails(fn(): _expr("?resource");))
+  | assert_true(_fails(fn(): cedar_parse("permit (principal, action == ?action, resource);");))
+  | assert_true(_fails(fn(): cedar_parse("permit (principal, action in [?action], resource);");))
+end
+
+def test_unknown_functions_and_methods_are_parse_errors():
+  assert_true(_fails(fn(): _expr("fn(1)");))
+  | assert_true(_fails(fn(): _expr("Ns::fn(1)");))
+  | assert_true(_fails(fn(): _expr("contains(1)");))
+  | assert_true(_fails(fn(): _expr("[1].foo(1)");))
+  | assert_true(_fails(fn(): _expr("context.a(1)");))
+  | assert_true(_fails(fn(): _expr("[1].contains()");))
+  | assert_true(_fails(fn(): _expr("[1].contains(1, 2)");))
+  | assert_true(_fails(fn(): _expr("[1].isEmpty(1)");))
+  | assert_true(_fails(fn(): _expr("context.a.isIpv4(1)");))
+  | assert_eq(len(_expr("ip()")["ip"]), 0)
 end
 
 def test_scope_action_in_single():
@@ -276,6 +393,13 @@ def test_expr_like_pattern():
   )
 end
 
+def test_expr_like_pattern_has_one_literal_per_character():
+  assert_eq(
+    _expr("principal.name like \"ab\"")["like"]["pattern"],
+    [{"Literal": "a"}, {"Literal": "b"}]
+  )
+end
+
 def test_expr_is():
   assert_eq(_expr("resource is Photo"), {"is": {"left": {"Var": "resource"}, "entity_type": "Photo"}})
 end
@@ -331,6 +455,11 @@ end
 def test_expr_set_literal():
   assert_eq(_expr("[1, \"a\"]"), {"Set": [{"Value": 1}, {"Value": "a"}]})
   | assert_eq(_expr("[]"), {"Set": []})
+end
+
+def test_expr_record_duplicate_key_rejected():
+  assert_true(_fails(fn(): _expr("{a: 1, a: 2}");))
+  | assert_true(_fails(fn(): _expr("{a: 1, \"a\": 2}");))
 end
 
 def test_expr_record_literal():
@@ -511,6 +640,25 @@ def test_stringify_expr_roundtrip_forms():
   | map(srcs, fn(s): _roundtrip_expr(s);)
 end
 
+def test_stringify_reserved_words_are_quoted():
+  _roundtrip_expr("context[\"has\"]")
+  | _roundtrip_expr("{\"if\": 1}[\"if\"]")
+  | _roundtrip_expr("context[\"true\"].a")
+  | _roundtrip_expr("context has \"like\"")
+  | _roundtrip_expr("context.principal")
+end
+
+def test_stringify_negation_of_literals_roundtrip():
+  _roundtrip_expr("-(1)")
+  | _roundtrip_expr("--1")
+  | _roundtrip_expr("-(-1)")
+  | _roundtrip_expr("- -0")
+  | _roundtrip_expr("-1.offset(duration(\"1h\"))")
+  | _roundtrip_expr("(-1).offset(duration(\"1h\"))")
+  | _roundtrip_expr("1 - -1")
+  | _roundtrip_expr("-(2) * 3")
+end
+
 def test_stringify_string_escapes_roundtrip():
   _roundtrip_expr("\"a\\\"b\\\\c\\nd\\te\"")
 end
@@ -528,4 +676,714 @@ end
 
 def test_stringify_unsupported_expression():
   assert_true(_fails(fn(): cedar_stringify([{"effect": "permit", "annotations": {}, "principal": {"op": "All"}, "action": {"op": "All"}, "resource": {"op": "All"}, "conditions": [{"kind": "when", "body": {"bogus": 1}}]}]);))
+end
+
+# -- Evaluation Tests --
+
+def _uid(t, i):
+  {"type": t, "id": i}
+end
+
+def _entities():
+  [
+    {"uid": _uid("User", "alice"), "attrs": {"name": "Alice", "age": 30, "tags": ["a", "b"], "manager": {"__entity": _uid("User", "bob")}, "profile": {"city": "Tokyo", "geo": {"lat": 35, "lon": 139}},
+     "addr": {"__extn": {"fn": "ip", "arg": "10.1.2.3"}}, "score": {"__extn": {"fn": "decimal", "arg": "2.50"}},
+     "since": {"__extn": {"fn": "datetime", "arg": "2024-10-15T11:35:00Z"}}, "ttl": {"__extn": {"fn": "duration", "arg": "1h30m"}}},
+   "parents": [_uid("Group", "staff")], "tags": {"role": "admin"}},
+    {"uid": _uid("User", "bob"), "attrs": {"name": "Bob"}, "parents": []},
+    {"uid": _uid("Group", "staff"), "attrs": {}, "parents": [_uid("Group", "all")]},
+    {"uid": _uid("Group", "all"), "attrs": {}, "parents": []},
+    {"uid": _uid("Photo", "p1"), "attrs": {"public": true, "owner": {"__entity": _uid("User", "alice")}}, "parents": [_uid("Album", "trip")]},
+    {"uid": _uid("Album", "trip"), "attrs": {}, "parents": []},
+    {"uid": _uid("Action", "view"), "attrs": {}, "parents": [_uid("Action", "read")]},
+    {"uid": _uid("Action", "read"), "attrs": {}, "parents": []}
+  ]
+end
+
+def _request():
+  {
+    "principal": _uid("User", "alice"),
+    "action": _uid("Action", "view"),
+    "resource": _uid("Photo", "p1"),
+    "context": {"mfa": true, "ip": {"__extn": {"fn": "ip", "arg": "10.0.0.5"}}, "n": 3, "name": "report.pdf", "nested": {"a": {"b": 1}}}
+  }
+end
+
+def _ev(src):
+  cedar_eval(src, _request(), _entities())
+end
+
+# True when evaluation raises one of this module's own errors (not an incidental runtime error).
+def _ev_fails(src):
+  starts_with(_error_message(fn(): _ev(src);), "cedar: ")
+end
+
+def _auth(src):
+  cedar_is_authorized(src, _request(), _entities())
+end
+
+def test_eval_literals():
+  assert_eq(_ev("true"), true)
+  | assert_eq(_ev("42"), 42)
+  | assert_eq(_ev("-7"), -7)
+  | assert_eq(_ev("\"a\\nb\""), "a\nb")
+  | assert_eq(_ev("User::\"alice\""), {"__entity": _uid("User", "alice")})
+end
+
+def test_eval_variables():
+  assert_eq(_ev("principal"), {"__entity": _uid("User", "alice")})
+  | assert_eq(_ev("context.n"), 3)
+  | assert_eq(_ev("context[\"name\"]"), "report.pdf")
+  | assert_eq(_ev("context.nested.a.b"), 1)
+end
+
+def test_eval_unbound_variable():
+  assert_true(_fails(fn(): cedar_eval("principal", {"context": {}}, []);))
+end
+
+def test_eval_arithmetic():
+  assert_eq(_ev("1 + 2 * 3"), 7)
+  | assert_eq(_ev("10 - 4 - 3"), 3)
+  | assert_eq(_ev("-(2 + 3)"), -5)
+  | assert_eq(_ev("context.n * context.n"), 9)
+end
+
+def test_eval_arithmetic_overflow():
+  assert_true(_ev_fails("9223372036854775807 + 1"))
+  | assert_true(_ev_fails("-9223372036854775808 - 1"))
+  | assert_true(_ev_fails("4611686018427387904 * 4"))
+  | assert_true(_ev_fails("-(-9223372036854775808)"))
+end
+
+def test_eval_arithmetic_type_error():
+  assert_true(_ev_fails("1 + \"a\""))
+  | assert_true(_ev_fails("true * 2"))
+  | assert_true(_ev_fails("-\"a\""))
+end
+
+def test_eval_comparison():
+  assert_eq(_ev("1 < 2"), true)
+  | assert_eq(_ev("2 <= 2"), true)
+  | assert_eq(_ev("3 > 4"), false)
+  | assert_eq(_ev("4 >= 5"), false)
+  | assert_true(_ev_fails("1 < \"a\""))
+  | assert_true(_ev_fails("\"a\" < \"b\""))
+end
+
+def test_eval_equality():
+  assert_eq(_ev("1 == 1"), true)
+  | assert_eq(_ev("1 == \"1\""), false)
+  | assert_eq(_ev("true != false"), true)
+  | assert_eq(_ev("User::\"alice\" == principal"), true)
+  | assert_eq(_ev("User::\"alice\" == Admin::\"alice\""), false)
+  | assert_eq(_ev("[1, 2] == [2, 1, 1]"), true)
+  | assert_eq(_ev("[1, 2] == [1, 3]"), false)
+  | assert_eq(_ev("{a: 1, b: [1]} == {b: [1], a: 1}"), true)
+  | assert_eq(_ev("{a: 1} == {a: 1, b: 2}"), false)
+  | assert_eq(_ev("[1] == 1"), false)
+end
+
+def test_eval_logic_short_circuit():
+  assert_eq(_ev("false && 3"), false)
+  | assert_eq(_ev("true || 3"), true)
+  | assert_eq(_ev("false && context.missing"), false)
+  | assert_eq(_ev("true || context.missing"), true)
+  | assert_true(_ev_fails("true && 3"))
+  | assert_true(_ev_fails("false || 3"))
+  | assert_true(_ev_fails("3 && true"))
+  | assert_eq(_ev("!false"), true)
+  | assert_true(_ev_fails("!1"))
+end
+
+def test_eval_if_then_else():
+  assert_eq(_ev("if context.mfa then 1 else 2"), 1)
+  | assert_eq(_ev("if !context.mfa then 1 else 2"), 2)
+  | assert_eq(_ev("if true then 1 else context.missing"), 1)
+  | assert_true(_ev_fails("if 1 then 1 else 2"))
+end
+
+def test_eval_sets_and_records():
+  assert_eq(_ev("[1, 1, 2]"), [1, 2])
+  | assert_eq(_ev("[1, 2].contains(2)"), true)
+  | assert_eq(_ev("[1, 2].contains(3)"), false)
+  | assert_eq(_ev("[1, 2, 3].containsAll([3, 1])"), true)
+  | assert_eq(_ev("[].containsAll([2])"), false)
+  | assert_eq(_ev("[2].containsAll([])"), true)
+  | assert_eq(_ev("[1, 2].containsAny([5, 2])"), true)
+  | assert_eq(_ev("[1, 2].containsAny([])"), false)
+  | assert_eq(_ev("[].isEmpty()"), true)
+  | assert_eq(_ev("[1].isEmpty()"), false)
+  | assert_eq(_ev("{a: 1 + 1, \"b c\": [2]}"), {"a": 2, "b c": [2]})
+  | assert_eq(_ev("resource.owner.manager.name"), "Bob")
+  | assert_true(_ev_fails("1.contains(1)"))
+  | assert_true(_ev_fails("[1].containsAll(1)"))
+  | assert_true(_ev_fails("{a: 1}.isEmpty()"))
+end
+
+def test_eval_set_of_extension_values_dedup():
+  assert_eq(len(_ev("[decimal(\"1.0\"), decimal(\"1.00\")]")), 1)
+end
+
+def test_eval_entity_attributes():
+  assert_eq(_ev("principal.name"), "Alice")
+  | assert_eq(_ev("principal.manager.name"), "Bob")
+  | assert_eq(_ev("resource.owner == principal"), true)
+  | assert_eq(_ev("principal.profile.city"), "Tokyo")
+  | assert_eq(_ev("principal.tags.contains(\"a\")"), true)
+  | assert_true(_ev_fails("principal.missing"))
+  | assert_true(_ev_fails("User::\"nobody\".name"))
+  | assert_true(_ev_fails("context.missing"))
+  | assert_true(_ev_fails("1.name"))
+end
+
+def test_eval_has():
+  assert_eq(_ev("principal has name"), true)
+  | assert_eq(_ev("principal has \"name\""), true)
+  | assert_eq(_ev("principal has missing"), false)
+  | assert_eq(_ev("User::\"nobody\" has name"), false)
+  | assert_eq(_ev("context has mfa"), true)
+  | assert_eq(_ev("context has nested.a.b"), true)
+  | assert_eq(_ev("context has nested.x.b"), false)
+  | assert_eq(_ev("context has missing.deeper"), false)
+  | assert_eq(_ev("principal has profile.city"), true)
+  | assert_true(_ev_fails("1 has a"))
+end
+
+def test_eval_in_hierarchy():
+  assert_eq(_ev("principal in Group::\"staff\""), true)
+  | assert_eq(_ev("principal in Group::\"all\""), true)
+  | assert_eq(_ev("principal in principal"), true)
+  | assert_eq(_ev("principal in Group::\"other\""), false)
+  | assert_eq(_ev("Group::\"all\" in principal"), false)
+  | assert_eq(_ev("principal in [Group::\"other\", Group::\"all\"]"), true)
+  | assert_eq(_ev("principal in []"), false)
+  | assert_eq(_ev("resource in Album::\"trip\""), true)
+  | assert_eq(_ev("User::\"ghost\" in User::\"ghost\""), true)
+  | assert_eq(_ev("User::\"ghost\" in Group::\"all\""), false)
+  | assert_true(_ev_fails("1 in Group::\"all\""))
+  | assert_true(_ev_fails("principal in 1"))
+  | assert_true(_ev_fails("principal in [Group::\"all\", 1]"))
+end
+
+def test_eval_in_cyclic_hierarchy():
+  let ents = [{"uid": _uid("G", "a"), "parents": [_uid("G", "b")]}, {"uid": _uid("G", "b"), "parents": [_uid("G", "a")]}]
+  | let req = {"principal": _uid("G", "a"), "action": _uid("A", "x"), "resource": _uid("R", "y")}
+  | assert_eq(cedar_eval("principal in G::\"b\"", req, ents), true)
+  | assert_eq(cedar_eval("principal in G::\"c\"", req, ents), false)
+end
+
+def test_eval_is():
+  assert_eq(_ev("principal is User"), true)
+  | assert_eq(_ev("principal is Group"), false)
+  | assert_eq(_ev("principal is User in Group::\"staff\""), true)
+  | assert_eq(_ev("principal is User in Group::\"other\""), false)
+  | assert_eq(_ev("principal is User in [Group::\"other\", Group::\"all\"]"), true)
+  | assert_eq(_ev("principal is User in []"), false)
+  | assert_eq(_ev("principal is Group in 1"), false)
+  | assert_true(_ev_fails("principal is User in 1"))
+  | assert_eq(_ev("principal is Group in Group::\"staff\""), false)
+  | assert_true(_ev_fails("1 is User"))
+end
+
+def test_eval_like():
+  assert_eq(_ev("context.name like \"report.pdf\""), true)
+  | assert_eq(_ev("context.name like \"report.*\""), true)
+  | assert_eq(_ev("context.name like \"*.pdf\""), true)
+  | assert_eq(_ev("context.name like \"r*t.p*f\""), true)
+  | assert_eq(_ev("context.name like \"*\""), true)
+  | assert_eq(_ev("context.name like \"*port*\""), true)
+  | assert_eq(_ev("context.name like \"*.txt\""), false)
+  | assert_eq(_ev("context.name like \"report\""), false)
+  | assert_eq(_ev("context.name like \"r*rt.pdf*\""), true)
+  | assert_eq(_ev("context.name like \"*pdf*pdf\""), false)
+  | assert_eq(_ev("\"\" like \"\""), true)
+  | assert_eq(_ev("\"\" like \"*\""), true)
+  | assert_eq(_ev("\"a\" like \"\""), false)
+  | assert_eq(_ev("\"a*b\" like \"a\\*b\""), true)
+  | assert_eq(_ev("\"axb\" like \"a\\*b\""), false)
+  | assert_eq(_ev("\"abab\" like \"a*ab\""), true)
+  | assert_eq(_ev("\"ab\" like \"a*ab\""), false)
+  | assert_eq(_ev("\"日本語\" like \"日*語\""), true)
+  | assert_true(_ev_fails("1 like \"a\""))
+end
+
+def test_eval_tags():
+  assert_eq(_ev("principal.hasTag(\"role\")"), true)
+  | assert_eq(_ev("principal.getTag(\"role\")"), "admin")
+  | assert_eq(_ev("principal.hasTag(\"other\")"), false)
+  | assert_eq(_ev("User::\"nobody\".hasTag(\"role\")"), false)
+  | assert_true(_ev_fails("principal.getTag(\"other\")"))
+  | assert_true(_ev_fails("User::\"nobody\".getTag(\"role\")"))
+  | assert_true(_ev_fails("principal.hasTag(1)"))
+  | assert_true(_ev_fails("\"a\".hasTag(\"a\")"))
+end
+
+# -- Evaluation Tests: extension types --
+
+def test_eval_ip_predicates():
+  assert_eq(_ev("ip(\"127.0.0.1\").isIpv4()"), true)
+  | assert_eq(_ev("ip(\"::1\").isIpv4()"), false)
+  | assert_eq(_ev("ip(\"ffee::/64\").isIpv6()"), true)
+  | assert_eq(_ev("ip(\"127.0.0.1/24\").isIpv6()"), false)
+  | assert_eq(_ev("ip(\"127.0.0.2\").isLoopback()"), true)
+  | assert_eq(_ev("ip(\"::1\").isLoopback()"), true)
+  | assert_eq(_ev("ip(\"::2\").isLoopback()"), false)
+  | assert_eq(_ev("ip(\"10.0.0.1\").isLoopback()"), false)
+  | assert_eq(_ev("ip(\"ff00::2\").isMulticast()"), true)
+  | assert_eq(_ev("ip(\"224.1.2.3\").isMulticast()"), true)
+  | assert_eq(_ev("ip(\"127.0.0.1\").isMulticast()"), false)
+end
+
+def test_eval_ip_in_range():
+  assert_eq(_ev("ip(\"192.168.0.1\").isInRange(ip(\"192.168.0.1/24\"))"), true)
+  | assert_eq(_ev("ip(\"192.168.0.75\").isInRange(ip(\"192.168.0.1/28\"))"), false)
+  | assert_eq(_ev("ip(\"192.168.0.1/28\").isInRange(ip(\"192.168.0.0/24\"))"), true)
+  | assert_eq(_ev("ip(\"192.168.0.0/24\").isInRange(ip(\"192.168.0.1/28\"))"), false)
+  | assert_eq(_ev("ip(\"10.1.2.3\").isInRange(ip(\"0.0.0.0/0\"))"), true)
+  | assert_eq(_ev("ip(\"2001:db8::1\").isInRange(ip(\"2001:db8::/32\"))"), true)
+  | assert_eq(_ev("ip(\"2001:db9::1\").isInRange(ip(\"2001:db8::/32\"))"), false)
+  | assert_eq(_ev("ip(\"10.0.0.1\").isInRange(ip(\"::/0\"))"), false)
+  | assert_eq(_ev("context.ip.isInRange(ip(\"10.0.0.0/8\"))"), true)
+  | assert_true(_ev_fails("ip(\"192.168.0.1\").isInRange(1)"))
+end
+
+def test_eval_ip_formats():
+  assert_eq(_ev("ip(\"::\").isIpv6()"), true)
+  | assert_eq(_ev("ip(\"1:2:3:4:5:6:7:8\").isIpv6()"), true)
+  | assert_eq(_ev("ip(\"1:2:3:4:5:6:7::\").isIpv6()"), true)
+  | assert_eq(_ev("ip(\"::ffff:c0a8:101\").isInRange(ip(\"::ffff:c0a8:0/112\"))"), true)
+  | assert_true(_ev_fails("ip(\"::ffff:1.2.3.4\")"))
+  | assert_true(_ev_fails("ip(\"1:2:3:4:5:6:1.2.3.4\")"))
+  | assert_true(_ev_fails("ip(\"1.2.3.4/08\")"))
+  | assert_eq(_ev("ip(\"1.2.3.4/0\").isIpv4()"), true)
+  | assert_true(_ev_fails("ip(\"1.2.3\")"))
+  | assert_true(_ev_fails("ip(\"1.2.3.256\")"))
+  | assert_true(_ev_fails("ip(\"01.2.3.4\")"))
+  | assert_true(_ev_fails("ip(\"1.2.3.4/33\")"))
+  | assert_true(_ev_fails("ip(\"1.2.3.4/\")"))
+  | assert_true(_ev_fails("ip(\"::1/129\")"))
+  | assert_true(_ev_fails("ip(\"1:2:3:4:5:6:7\")"))
+  | assert_true(_ev_fails("ip(\"1::2::3\")"))
+  | assert_true(_ev_fails("ip(\"12345::\")"))
+  | assert_true(_ev_fails("ip(\"1:2:3:4:5:6:7:8:9\")"))
+  | assert_true(_ev_fails("ip(\"1:2:3:4:5:6:7:8::\")"))
+  | assert_true(_ev_fails("ip(\"not an ip\")"))
+  | assert_true(_ev_fails("ip(1)"))
+end
+
+def test_eval_ip_equality():
+  assert_eq(_ev("ip(\"10.0.0.1\") == ip(\"10.0.0.1/32\")"), true)
+  | assert_eq(_ev("ip(\"10.0.0.1\") == ip(\"10.0.0.2\")"), false)
+  | assert_eq(_ev("ip(\"10.0.0.1/24\") == ip(\"10.0.0.1/16\")"), false)
+  | assert_eq(_ev("ip(\"::1\") == ip(\"0:0:0:0:0:0:0:1\")"), true)
+  | assert_eq(_ev("ip(\"10.0.0.1\") == \"10.0.0.1\""), false)
+  | assert_eq(_ev("context.ip == ip(\"10.0.0.5\")"), true)
+end
+
+def test_eval_decimal():
+  assert_eq(_ev("decimal(\"1.23\").lessThan(decimal(\"1.24\"))"), true)
+  | assert_eq(_ev("decimal(\"1.23\").lessThanOrEqual(decimal(\"1.23\"))"), true)
+  | assert_eq(_ev("decimal(\"-1.23\").greaterThan(decimal(\"-1.24\"))"), true)
+  | assert_eq(_ev("decimal(\"-1.23\").greaterThanOrEqual(decimal(\"1.23\"))"), false)
+  | assert_eq(_ev("decimal(\"-0.5\").lessThan(decimal(\"0.0\"))"), true)
+  | assert_eq(_ev("decimal(\"-0.0001\").lessThan(decimal(\"0.0000\"))"), true)
+  | assert_eq(_ev("decimal(\"0.1\").lessThan(decimal(\"0.1000\"))"), false)
+  | assert_eq(_ev("decimal(\"1.0\") == decimal(\"1.00\")"), true)
+  | assert_eq(_ev("decimal(\"1.0\") == decimal(\"1.0001\")"), false)
+  | assert_eq(_ev("decimal(\"-0.0\") == decimal(\"0.0\")"), true)
+  | assert_eq(_ev("decimal(\"922337203685477.5807\").greaterThan(decimal(\"0.0\"))"), true)
+  | assert_eq(_ev("decimal(\"-922337203685477.5808\").lessThan(decimal(\"0.0\"))"), true)
+end
+
+def test_eval_decimal_errors():
+  assert_true(_ev_fails("decimal(\"1\")"))
+  | assert_true(_ev_fails("decimal(\"1.\")"))
+  | assert_true(_ev_fails("decimal(\".5\")"))
+  | assert_true(_ev_fails("decimal(\"1.12345\")"))
+  | assert_true(_ev_fails("decimal(\"+1.0\")"))
+  | assert_true(_ev_fails("decimal(\"a.b\")"))
+  | assert_true(_ev_fails("decimal(\"922337203685477.5808\")"))
+  | assert_true(_ev_fails("decimal(\"-922337203685477.5809\")"))
+  | assert_true(_ev_fails("decimal(\"922337203685478.0\")"))
+  | assert_true(_ev_fails("decimal(\"1.1\").lessThan(2)"))
+  | assert_true(_ev_fails("decimal(\"1.1\") < decimal(\"1.2\")"))
+end
+
+def test_eval_datetime_parse_and_equality():
+  assert_eq(_ev("datetime(\"2024-10-15\") == datetime(\"2024-10-15T00:00:00Z\")"), true)
+  | assert_eq(_ev("datetime(\"2024-10-15T11:35:00Z\") == datetime(\"2024-10-15T12:35:00.000+0100\")"), true)
+  | assert_eq(_ev("datetime(\"2024-10-15T11:35:00Z\") == datetime(\"2024-10-15T11:35:00.001Z\")"), false)
+  | assert_eq(_ev("datetime(\"2024-10-15T00:00:00-0230\") == datetime(\"2024-10-15T02:30:00Z\")"), true)
+  | assert_eq(_ev("datetime(\"1970-01-01\").durationSince(datetime(\"1969-12-31\")) == duration(\"1d\")"), true)
+  | assert_eq(_ev("datetime(\"2024-02-29\") == datetime(\"2024-02-29T00:00:00Z\")"), true)
+  | assert_eq(_ev("datetime(\"0000-01-01T00:00:00+2359\") < datetime(\"0000-01-01\")"), true)
+  | assert_eq(_ev("datetime(\"9999-12-31T23:59:59-2359\") > datetime(\"9999-12-31\")"), true)
+end
+
+def test_eval_datetime_errors():
+  assert_true(_ev_fails("datetime(\"2025-02-31\")"))
+  | assert_true(_ev_fails("datetime(\"2023-02-29\")"))
+  | assert_true(_ev_fails("datetime(\"1900-02-29\")"))
+  | assert_eq(_ev("datetime(\"2000-02-29\") < datetime(\"2000-03-01\")"), true)
+  | assert_true(_ev_fails("datetime(\"2024-13-01\")"))
+  | assert_true(_ev_fails("datetime(\"2024-00-10\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T24:00:00Z\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T10:60:00Z\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T10:00:60Z\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T10:00:00+2400\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T10:00:00+0060\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T10:00:00\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T10:00Z\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T\")"))
+  | assert_true(_ev_fails("datetime(\"24-10-15\")"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15T10:00:00.12Z\")"))
+end
+
+def test_eval_datetime_methods():
+  assert_eq(_ev("datetime(\"2024-10-15T00:18:00Z\").offset(duration(\"42m\")) == datetime(\"2024-10-15T01:00:00Z\")"), true)
+  | assert_eq(_ev("datetime(\"2024-10-15T01:00:00Z\").durationSince(datetime(\"2024-10-15\")) == duration(\"1h\")"), true)
+  | assert_eq(_ev("datetime(\"2024-10-14\").durationSince(datetime(\"2024-10-15\")) == duration(\"-1d\")"), true)
+  | assert_eq(_ev("datetime(\"2025-02-20T10:35:00Z\").toDate() == datetime(\"2025-02-20\")"), true)
+  | assert_eq(_ev("datetime(\"2025-02-20T10:35:00Z\").toTime() == duration(\"10h35m\")"), true)
+  | assert_eq(_ev("datetime(\"2024-12-31T23:59:59Z\").offset(duration(\"1s\")) == datetime(\"2025-01-01\")"), true)
+  | assert_eq(_ev("datetime(\"2024-02-28\").offset(duration(\"1d\")) == datetime(\"2024-02-29\")"), true)
+  | assert_eq(_ev("datetime(\"2023-02-28\").offset(duration(\"1d\")) == datetime(\"2023-03-01\")"), true)
+  | assert_eq(_ev("datetime(\"2024-10-15T11:35:00.250Z\").offset(duration(\"-250ms\")) == datetime(\"2024-10-15T11:35:00Z\")"), true)
+  | assert_eq(_ev("datetime(\"1969-12-31T23:00:00Z\").toDate() == datetime(\"1969-12-31\")"), true)
+  | assert_eq(_ev("datetime(\"1969-12-31T23:00:00Z\").toTime() == duration(\"23h\")"), true)
+  | assert_eq(_ev("datetime(\"1960-01-01T12:00:00Z\").toDate() == datetime(\"1960-01-01\")"), true)
+  | assert_eq(_ev("datetime(\"9999-12-31T23:59:59Z\").offset(duration(\"2d\")).durationSince(datetime(\"9999-12-31T23:59:59Z\")) == duration(\"2d\")"), true)
+  | assert_eq(_ev("datetime(\"9999-12-31T23:59:59Z\").offset(duration(\"2d\")) > datetime(\"9999-12-31T23:59:59-2359\")"), true)
+  | assert_eq(_ev("datetime(\"0000-01-01\").offset(duration(\"-1d\")).offset(duration(\"1d\")) == datetime(\"0000-01-01\")"), true)
+  | assert_true(_ev_fails("datetime(\"2024-10-15\").offset(1)"))
+  | assert_true(_ev_fails("duration(\"1h\").toDate()"))
+end
+
+def test_eval_datetime_ordering():
+  assert_eq(_ev("datetime(\"2024-10-15\") < datetime(\"2024-10-16\")"), true)
+  | assert_eq(_ev("datetime(\"2024-10-15\") <= datetime(\"2024-10-15T00:00:00Z\")"), true)
+  | assert_eq(_ev("datetime(\"2024-10-15\") > datetime(\"2024-10-16\")"), false)
+  | assert_eq(_ev("datetime(\"1969-01-01\") < datetime(\"1970-01-01\")"), true)
+  | assert_true(_ev_fails("datetime(\"2024-10-15\") < 1"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15\") < duration(\"1d\")"))
+end
+
+def test_eval_duration():
+  assert_eq(_ev("duration(\"4s100ms\").toMilliseconds()"), 4100)
+  | assert_eq(_ev("duration(\"4s100ms\").toSeconds()"), 4)
+  | assert_eq(_ev("duration(\"100ms\").toSeconds()"), 0)
+  | assert_eq(_ev("duration(\"4m30s\").toMinutes()"), 4)
+  | assert_eq(_ev("duration(\"4m70s\").toMinutes()"), 5)
+  | assert_eq(_ev("duration(\"4h30m\").toHours()"), 4)
+  | assert_eq(_ev("duration(\"4h70m\").toHours()"), 5)
+  | assert_eq(_ev("duration(\"4d10h\").toDays()"), 4)
+  | assert_eq(_ev("duration(\"4d30h\").toDays()"), 5)
+  | assert_eq(_ev("duration(\"-1d12h\").toHours()"), -36)
+  | assert_eq(_ev("duration(\"-90s\").toMinutes()"), -1)
+  | assert_eq(_ev("duration(\"1d\") == duration(\"24h\")"), true)
+  | assert_eq(_ev("duration(\"2h30m\") == duration(\"150m\")"), true)
+  | assert_eq(_ev("duration(\"5ms\").toMilliseconds()"), 5)
+  | assert_eq(_ev("duration(\"1m1ms\").toMilliseconds()"), 60001)
+  | assert_eq(_ev("duration(\"-1d\") < duration(\"1s\")"), true)
+  | assert_eq(_ev("duration(\"1h\") >= duration(\"60m\")"), true)
+  | assert_eq(_ev("duration(\"1h\") > duration(\"61m\")"), false)
+end
+
+def test_eval_duration_errors():
+  assert_true(_ev_fails("duration(\"\")"))
+  | assert_true(_ev_fails("duration(\"-\")"))
+  | assert_true(_ev_fails("duration(\"1\")"))
+  | assert_true(_ev_fails("duration(\"1x\")"))
+  | assert_true(_ev_fails("duration(\"1h1d\")"))
+  | assert_true(_ev_fails("duration(\"1h1h\")"))
+  | assert_true(_ev_fails("duration(\"1.5h\")"))
+  | assert_true(_ev_fails("duration(\"+1h\")"))
+  | assert_true(_ev_fails("duration(\"99999999999999999999d\")"))
+  | assert_true(_ev_fails("duration(\"9223372036854775808ms\")"))
+  | assert_true(_ev_fails("duration(\"-9223372036854775809ms\")"))
+  | assert_eq(_ev("duration(\"-9223372036854775808ms\") < duration(\"0ms\")"), true)
+  | assert_true(_ev_fails("duration(\"1h\").toDays(1)"))
+  | assert_true(_ev_fails("datetime(\"2024-10-15\").toDays()"))
+end
+
+def test_eval_unknown_function():
+  assert_true(_ev_fails("bogus(1)"))
+  | assert_true(_ev_fails("principal.bogus()"))
+  | assert_true(_ev_fails("ip(\"1.1.1.1\", 2)"))
+  | assert_true(_ev_fails("Ns::fn(1)"))
+end
+
+def test_eval_extension_values_in_context():
+  let req = {"principal": _uid("U", "a"), "action": _uid("A", "x"), "resource": _uid("R", "y"),
+             "context": {"score": {"__extn": {"fn": "decimal", "arg": "2.50"}}, "at": {"__extn": {"fn": "datetime", "arg": "2024-10-15T11:35:00Z"}}}}
+  | assert_eq(cedar_eval("context.score.greaterThan(decimal(\"2.5\")) == false", req, []), true)
+  | assert_eq(cedar_eval("context.score == decimal(\"2.5000\")", req, []), true)
+  | assert_eq(cedar_eval("context.at.toDate() == datetime(\"2024-10-15\")", req, []), true)
+end
+
+def test_eval_result_values():
+  assert_eq(_ev("ip(\"10.0.0.1\")"), {"__extn": {"fn": "ip", "arg": "10.0.0.1"}})
+  | assert_eq(_ev("datetime(\"2024-10-15\").offset(duration(\"1h\"))"), {"__extn": {"fn": "datetime", "arg": "2024-10-15T01:00:00.000Z"}})
+  | assert_eq(_ev("duration(\"1s\")"), {"__extn": {"fn": "duration", "arg": "1s"}})
+  | assert_eq(_ev("datetime(\"2024-10-15\").durationSince(datetime(\"2024-10-14\"))"), {"__extn": {"fn": "duration", "arg": "86400000ms"}})
+end
+
+def test_eval_expression_input_forms():
+  assert_eq(cedar_eval({"+": {"left": {"Value": 1}, "right": {"Value": 2}}}, _request(), _entities()), 3)
+  | assert_true(_ev_fails("1 + 2 3"))
+  | assert_true(_ev_fails("1 +"))
+end
+
+def test_eval_request_forms():
+  let ents = _entities()
+  | let a = cedar_eval("principal", {"principal": "User::\"alice\"", "action": _uid("A", "x"), "resource": _uid("R", "y")}, ents)
+  | let b = cedar_eval("principal", {"principal": {"__entity": _uid("User", "alice")}, "action": _uid("A", "x"), "resource": _uid("R", "y")}, ents)
+  | assert_eq(a, b)
+  | assert_true(_fails(fn(): cedar_eval("1", {"context": 1}, ents);))
+  | assert_true(_fails(fn(): cedar_eval("1", {"principal": 1}, ents);))
+end
+
+def test_eval_duplicate_entities():
+  assert_true(_fails(fn(): cedar_eval("1", _request(), [{"uid": _uid("A", "a")}, {"uid": _uid("A", "a")}]);))
+end
+
+# -- Evaluation Tests: authorization --
+
+def test_authz_default_deny():
+  assert_eq(_auth([]), {"decision": "deny", "reasons": [], "errors": []})
+  | assert_eq(_auth("permit (principal == User::\"bob\", action, resource);"), {"decision": "deny", "reasons": [], "errors": []})
+end
+
+def test_authz_permit():
+  assert_eq(_auth("permit (principal, action, resource);"), {"decision": "allow", "reasons": ["policy0"], "errors": []})
+end
+
+def test_authz_forbid_overrides_permit():
+  let r = _auth("permit (principal, action, resource);\n@id(\"no\") forbid (principal, action, resource);")
+  | assert_eq(r, {"decision": "deny", "reasons": ["no"], "errors": []})
+end
+
+def test_authz_reasons_use_ids_and_all_matches():
+  let r = _auth("@id(\"a\") permit (principal, action, resource);\npermit (principal, action, resource);\npermit (principal == User::\"bob\", action, resource);")
+  | assert_eq(r, {"decision": "allow", "reasons": ["a", "policy1"], "errors": []})
+end
+
+def test_authz_scope_principal():
+  assert_eq(_auth("permit (principal == User::\"alice\", action, resource);")["decision"], "allow")
+  | assert_eq(_auth("permit (principal == User::\"bob\", action, resource);")["decision"], "deny")
+  | assert_eq(_auth("permit (principal in Group::\"all\", action, resource);")["decision"], "allow")
+  | assert_eq(_auth("permit (principal in Group::\"x\", action, resource);")["decision"], "deny")
+  | assert_eq(_auth("permit (principal is User, action, resource);")["decision"], "allow")
+  | assert_eq(_auth("permit (principal is Group, action, resource);")["decision"], "deny")
+  | assert_eq(_auth("permit (principal is User in Group::\"staff\", action, resource);")["decision"], "allow")
+  | assert_eq(_auth("permit (principal is User in Group::\"x\", action, resource);")["decision"], "deny")
+end
+
+def test_authz_scope_action():
+  assert_eq(_auth("permit (principal, action == Action::\"view\", resource);")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action == Action::\"edit\", resource);")["decision"], "deny")
+  | assert_eq(_auth("permit (principal, action in Action::\"read\", resource);")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action in [Action::\"edit\", Action::\"view\"], resource);")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action in [Action::\"edit\", Action::\"write\"], resource);")["decision"], "deny")
+  | assert_eq(_auth("permit (principal, action in [], resource);")["decision"], "deny")
+end
+
+def test_authz_scope_resource():
+  assert_eq(_auth("permit (principal, action, resource == Photo::\"p1\");")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action, resource in Album::\"trip\");")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action, resource is Photo in Album::\"trip\");")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action, resource is Photo in Album::\"x\");")["decision"], "deny")
+  | assert_eq(_auth("permit (principal, action, resource is Album);")["decision"], "deny")
+end
+
+def test_authz_conditions():
+  assert_eq(_auth("permit (principal, action, resource) when { context.mfa };")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action, resource) when { !context.mfa };")["decision"], "deny")
+  | assert_eq(_auth("permit (principal, action, resource) unless { context.mfa };")["decision"], "deny")
+  | assert_eq(_auth("permit (principal, action, resource) unless { !context.mfa };")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action, resource) when { resource.public } unless { principal.age < 18 };")["decision"], "allow")
+  | assert_eq(_auth("permit (principal, action, resource) when { resource.public } unless { principal.age >= 18 };")["decision"], "deny")
+  | assert_eq(_auth("permit (principal, action, resource) when { true } when { false };")["decision"], "deny")
+end
+
+def test_authz_error_policy_is_skipped():
+  let r = _auth("@id(\"bad\") forbid (principal, action, resource) when { context.missing };\n@id(\"ok\") permit (principal, action, resource);")
+  | assert_eq(r["decision"], "allow")
+  | assert_eq(r["reasons"], ["ok"])
+  | assert_eq(len(r["errors"]), 1)
+  | assert_eq(r["errors"][0]["policy"], "bad")
+  | assert_true(contains(r["errors"][0]["message"], "missing"))
+end
+
+def test_authz_error_permit_does_not_allow():
+  let r = _auth("permit (principal, action, resource) when { 1 };")
+  | assert_eq(r["decision"], "deny")
+  | assert_eq(r["reasons"], [])
+  | assert_eq(len(r["errors"]), 1)
+  | assert_eq(r["errors"][0]["policy"], "policy0")
+end
+
+def test_authz_condition_error_stops_evaluation():
+  let r = _auth("permit (principal, action, resource) when { false } when { 1 + \"a\" };")
+  | assert_eq(r, {"decision": "deny", "reasons": [], "errors": []})
+end
+
+def test_authz_scope_mismatch_skips_conditions():
+  let r = _auth("permit (principal == User::\"bob\", action, resource) when { context.missing };")
+  | assert_eq(r, {"decision": "deny", "reasons": [], "errors": []})
+end
+
+def test_authz_input_forms():
+  let parsed = cedar_parse("permit (principal, action, resource);")
+  | assert_eq(_auth(parsed)["decision"], "allow")
+  | assert_eq(_auth(first(parsed))["decision"], "allow")
+  | assert_eq(cedar_is_authorized(parsed, _request(), [])["decision"], "allow")
+end
+
+def test_authz_requires_full_request():
+  assert_true(_fails(fn(): cedar_is_authorized([], {"principal": _uid("U", "a")}, []);))
+end
+
+def test_authz_sample_policies():
+  let ps = "@id(\"view-photos\")
+permit (principal in Group::\"staff\", action in [Action::\"view\", Action::\"list\"], resource is Photo in Album::\"trip\")
+when { resource.public || principal == resource.owner }
+unless { resource has archived && resource.archived };
+
+@id(\"need-mfa\")
+forbid (principal, action, resource)
+unless { context.mfa && context.ip.isIpv4() };"
+  | assert_eq(_auth(ps), {"decision": "allow", "reasons": ["view-photos"], "errors": []})
+  | let no_mfa = set(_request(), "context", {"mfa": false, "ip": {"__extn": {"fn": "ip", "arg": "10.0.0.5"}}})
+  | assert_eq(cedar_is_authorized(ps, no_mfa, _entities()), {"decision": "deny", "reasons": ["need-mfa"], "errors": []})
+end
+
+def test_authz_unlinked_template_is_an_error():
+  let r = _auth("@id(\"t\") permit (principal == ?principal, action, resource);")
+  | assert_eq(r["decision"], "deny")
+  | assert_eq(r["errors"][0]["policy"], "t")
+end
+
+def test_link_template():
+  let t = first(cedar_parse("@id(\"t\") permit (principal == ?principal, action, resource in ?resource) when { principal == User::\"alice\" };"))
+  | let linked = cedar_link(t, {"?principal": _uid("User", "alice"), "?resource": "Album::\"trip\""})
+  | assert_eq(linked["principal"], {"op": "==", "entity": _uid("User", "alice")})
+  | assert_eq(linked["resource"], {"op": "in", "entity": _uid("Album", "trip")})
+  | assert_eq(_auth(linked), {"decision": "allow", "reasons": ["t"], "errors": []})
+  | let other = cedar_link(t, {"?principal": _uid("User", "bob"), "?resource": _uid("Album", "trip")})
+  | assert_eq(_auth(other)["decision"], "deny")
+end
+
+def test_link_template_is_in():
+  let t = first(cedar_parse("permit (principal is User in ?principal, action, resource);"))
+  | let linked = cedar_link(t, {"?principal": _uid("Group", "staff")})
+  | assert_eq(linked["principal"], {"op": "is", "entity_type": "User", "in": {"entity": _uid("Group", "staff")}})
+  | assert_eq(_auth(linked)["decision"], "allow")
+end
+
+def test_link_template_missing_slot():
+  let t = first(cedar_parse("permit (principal == ?principal, action, resource == ?resource);"))
+  | assert_true(_fails(fn(): cedar_link(t, {"?principal": _uid("User", "alice")});))
+end
+
+def test_link_template_without_slots_is_unchanged():
+  let p = first(cedar_parse("permit (principal, action, resource) when { context.mfa };"))
+  | assert_eq(cedar_link(p, {}), p)
+end
+
+# -- Evaluation Tests: robustness --
+
+def test_eval_unsupported_nodes():
+  assert_true(starts_with(_error_message(fn(): cedar_eval({"bogus": 1}, _request(), _entities());), "cedar: unsupported expression"))
+  | assert_true(starts_with(_error_message(fn(): cedar_eval({"Slot": "?principal"}, _request(), _entities());), "cedar: unlinked template slot"))
+  | let ps = [{"effect": "permit", "annotations": {}, "principal": {"op": "bogus"}, "action": {"op": "All"}, "resource": {"op": "All"}, "conditions": []}]
+  | let r = _auth(ps)
+  | assert_eq(r["decision"], "deny")
+  | assert_true(contains(r["errors"][0]["message"], "unsupported scope operator"))
+end
+
+def test_eval_unknown_extension_type_in_data():
+  let req = {"principal": _uid("U", "a"), "action": _uid("A", "x"), "resource": _uid("R", "y"), "context": {"v": {"__extn": {"fn": "mystery", "arg": "1"}}}}
+  | assert_true(starts_with(_error_message(fn(): cedar_eval("context.v == context.v", req, []);), "cedar: unknown extension type"))
+  | assert_eq(cedar_eval("context.v == 1", req, []), false)
+end
+
+def test_eval_extension_values_with_bad_arguments_in_data():
+  let req = {"principal": _uid("U", "a"), "action": _uid("A", "x"), "resource": _uid("R", "y"), "context": {"ip": {"__extn": {"fn": "ip", "arg": "nope"}}}}
+  | assert_true(starts_with(_error_message(fn(): cedar_eval("context.ip.isIpv4()", req, []);), "cedar: invalid ip address"))
+end
+
+def test_eval_deep_hierarchy():
+  let n = 150
+  | let ents = map(range(0, n - 1), fn(i): {"uid": _uid("G", to_string(i)), "parents": [_uid("G", to_string(i + 1))]};)
+  | let req = {"principal": _uid("G", "0"), "action": _uid("A", "x"), "resource": _uid("R", "y")}
+  | assert_eq(cedar_eval("principal in G::\"" + to_string(n) + "\"", req, ents), true)
+  | assert_eq(cedar_eval("principal in G::\"x\"", req, ents), false)
+end
+
+def test_eval_wide_hierarchy_visits_each_entity_once():
+  let parents = map(range(0, 29), fn(i): _uid("M", to_string(i));)
+  | let mids = map(range(0, 29), fn(i): {"uid": _uid("M", to_string(i)), "parents": [_uid("Top", "t")]};)
+  | let ents = [{"uid": _uid("U", "a"), "parents": parents}] + mids
+  | let req = {"principal": _uid("U", "a"), "action": _uid("A", "x"), "resource": _uid("R", "y")}
+  | assert_eq(cedar_eval("principal in Top::\"t\"", req, ents), true)
+  | assert_eq(cedar_eval("principal in Top::\"nope\"", req, ents), false)
+end
+
+def test_eval_many_policies():
+  let one = "permit (principal == User::\"bob\", action, resource);\n"
+  | let text = join(map(range(1, 120), fn(i): one;), "") + "@id(\"last\") permit (principal, action, resource);"
+  | assert_eq(_auth(text), {"decision": "allow", "reasons": ["last"], "errors": []})
+end
+
+def test_eval_entity_attributes_hold_all_value_kinds():
+  assert_eq(_ev("principal.addr.isInRange(ip(\"10.0.0.0/8\"))"), true)
+  | assert_eq(_ev("principal.since.durationSince(datetime(\"2024-10-15\")) == duration(\"11h35m\")"), true)
+  | assert_eq(_ev("principal.score.greaterThan(decimal(\"2.49\"))"), true)
+  | assert_eq(_ev("principal.ttl.toMinutes()"), 90)
+  | assert_eq(_ev("principal.profile.geo.lat"), 35)
+  | assert_eq(_ev("principal.manager == User::\"bob\""), true)
+end
+
+# -- Evaluation Tests: templates --
+
+def test_link_substitutes_slots_in_json_conditions():
+  let t = {"effect": "permit", "annotations": {"id": "t"}, "principal": {"op": "==", "slot": "?principal"}, "action": {"op": "All"}, "resource": {"op": "All"},
+           "conditions": [{"kind": "when", "body": {"==": {"left": {"Var": "principal"}, "right": {"Slot": "?principal"}}}}]}
+  | let linked = cedar_link(t, {"?principal": _uid("User", "alice")})
+  | assert_eq(linked["conditions"][0]["body"]["=="]["right"], {"Value": {"__entity": _uid("User", "alice")}})
+  | assert_eq(_auth(linked)["decision"], "allow")
+end
+
+def test_link_does_not_touch_records_with_a_slot_attribute():
+  let t = first(cedar_parse("permit (principal == ?principal, action, resource) when { {Slot: 1}.Slot == 1 };"))
+  | let linked = cedar_link(t, {"?principal": _uid("User", "alice")})
+  | assert_eq(linked["conditions"], t["conditions"])
+  | assert_eq(_auth(linked)["decision"], "allow")
+end
+
+def test_link_leaves_the_template_unchanged():
+  let t = first(cedar_parse("permit (principal == ?principal, action, resource);"))
+  | let _ = cedar_link(t, {"?principal": _uid("User", "alice")})
+  | assert_eq(t["principal"], {"op": "==", "slot": "?principal"})
+end
+
+# -- Stringify and evaluation --
+
+def test_stringify_preserves_decisions():
+  let src = "@id(\"a\") permit (principal in Group::\"staff\", action in [Action::\"view\", Action::\"edit\"], resource is Photo in Album::\"trip\")
+when { resource.public && !(principal.age < 18) || context.n > 100 }
+unless { context has banned && context.banned };
+@id(\"b\") forbid (principal, action, resource) unless { context.mfa && context.ip.isInRange(ip(\"10.0.0.0/8\")) };
+@id(\"c\") permit (principal, action, resource) when { [1, 2].contains(context.n) && context.name like \"re*rt.*\" };"
+  | let printed = cedar_stringify(cedar_parse(src))
+  | let contexts = [_request()["context"], set(_request()["context"], "mfa", false), set(_request()["context"], "n", 200), {}]
+  | map(contexts, fn(ctx):
+      let req = set(_request(), "context", ctx)
+      | assert_eq(cedar_is_authorized(printed, req, _entities()), cedar_is_authorized(src, req, _entities()));)
+end
+
+def test_stringify_unsupported_scope_operator():
+  let p = {"effect": "permit", "annotations": {}, "principal": {"op": "bogus"}, "action": {"op": "All"}, "resource": {"op": "All"}, "conditions": []}
+  | assert_true(contains(_error_message(fn(): cedar_stringify(p);), "unsupported scope operator"))
 end
