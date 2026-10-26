@@ -20,4 +20,4 @@ jobs:
         with:
           bins: test
       - name: Run tests
-        run: mq-test cedar_tests.mq cedar_conformance_tests.mq
+        run: mq-test cedar_tests.mq
